@@ -27,12 +27,17 @@ echo "Run Benchmark"
 # 3. Run the benchmarks
 ./pharo Pharo.image eval --save "
 
-| comparison files |
-comparison := CooBenchRunner necTests.
-files := CooBenchRunner
-    export: comparison
-    to: '/Users/omar/Desktop/HeuristicCompletion-Benchmarks-Multiples/benchmark-results'.
-files inspect.
+| matrix |
+
+matrix := CooBenchRunner
+    compareModels: CooLLMClient benchmarkModels
+    messagesAndVariablesFor: #('NECompletion-Tests').
+
+CooBenchRunner
+    exportModels: matrix
+    to: '/Users/omar/Desktop/heuristics-vs-llm'.
+
+matrix inspect.
 "
 
 
