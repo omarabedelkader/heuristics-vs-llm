@@ -25,7 +25,15 @@ echo "2-INSTALL REPO OK"
 
 echo "Run Benchmark"
 # 3. Run the benchmarks
-./pharo Pharo.image eval --save "CooBenchRunnerMessage nec."
-./pharo Pharo.image eval --save "CooBenchRunnerVariables nec."
+./pharo Pharo.image eval --save "
+
+| comparison files |
+comparison := CooBenchRunner necTests.
+files := CooBenchRunner
+    export: comparison
+    to: '/Users/omar/Desktop/HeuristicCompletion-Benchmarks-Multiples/benchmark-results'.
+files inspect.
+"
+
 
 echo "3-RUN BENCHMARKS OK"
