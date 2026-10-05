@@ -28,7 +28,7 @@ echo "Run Benchmark"
 ./pharo Pharo.image eval --save "
 
 | comparison files |
-comparison := CooBenchRunner randomPackages: 10.
+comparison := CooBenchRunner randomPackages: 40.
 files := CooBenchRunner
     export: comparison
     to: '/Users/omar/Desktop/HeuristicCompletion-Benchmarks-Multiples/benchmark-results'.
