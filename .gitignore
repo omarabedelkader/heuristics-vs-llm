@@ -1,1 +1,5 @@
 image/
+oar-runs/
+.ollama-models/
+*.err
+*.out
