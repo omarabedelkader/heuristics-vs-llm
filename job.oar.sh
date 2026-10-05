@@ -2,7 +2,7 @@
 
 #OAR -q default
 #OAR -p chirop
-#OAR -l host=1,walltime=48:00:00
+#OAR -l host=1,walltime=14:00:00
 #OAR -n heuristic-completion-benchmark
 #OAR -O heuristic-completion.%jobid%.out
 #OAR -E heuristic-completion.%jobid%.err
