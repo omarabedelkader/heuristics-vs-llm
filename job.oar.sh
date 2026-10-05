@@ -547,16 +547,12 @@ cd "$IMAGE_DIR"
 
 ./pharo Pharo.image eval --save "
 
-| matrix |
-
-matrix := CooBenchRunner
-    compareModels: CooLLMClient benchmarkModels
-    messagesAndVariablesFor: #('NECompletion-Tests').
-
-CooBenchRunner
-    exportModels: matrix
+| comparison files |
+comparison := CooBenchRunner randomPackages: 40.
+files := CooBenchRunner
+    export: comparison
     to: '$RESULTS_DIR'.
-
+files inspect.
 "
 
 
