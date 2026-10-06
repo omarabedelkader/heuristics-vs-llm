@@ -2,5 +2,6 @@ image/
 oar-runs/
 .ollama-models/
 experiment/
+experiment-necompletion-smoke/
 *.err
 *.out

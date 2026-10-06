@@ -33,3 +33,18 @@ in the older snapshot.
 Detailed local smoke artifacts are in
 `/private/tmp/coo-package-split-work/pipeline-smoke/`. The independent fresh
 50-package setup is in `/private/tmp/coo-package-split-work/setup-smoke/`.
+
+## Re-ranker performance image
+
+The package-count workflow is restored; the explicit NECompletion-only code was
+removed. Existing smoke result files were preserved.
+
+- **95 Pharo tests and 9 Python tests passed**.
+- Export regression verifies a separate `performance-re-ranker.png`, preservation
+  of the normal `performance.png`, repeated export, and no additional inference.
+- A real ONNX/HTTP run on a tiny held-out fixture generated eight measured
+  time/memory points (four re-rankers, Methods and Classes), the table and PNG.
+- Visually inspected the PNG. Its memory axis is the existing Pharo VM memory
+  delta metric; a tiny fixture can produce zero memory change.
+- Artifacts: `/private/tmp/coo-reranker-performance-work/plot-smoke/`.
+- No commits or pushes were made.

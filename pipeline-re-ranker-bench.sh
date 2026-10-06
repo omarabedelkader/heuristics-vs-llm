@@ -96,6 +96,7 @@ split := CooBenchmarkSplit readFrom: directory / 'split.json'.
 comparison := CooBenchRunner rerankerBenchmarksForSplit: split.
 file := CooBenchRunner exportReranker: comparison to: (OSEnvironment current at: 'RESULTS_DIR').
 Stdio stdout nextPutAll: file fullName; lf.
+Stdio stdout nextPutAll: (file parent / 'performance-re-ranker.png') fullName; lf.
 "
 echo "Re-ranking benchmarks complete: $RESULTS_DIR"
 echo "Model, separate training/test corpora, split, evaluation and log: $RERANKER_RUN_DIR"

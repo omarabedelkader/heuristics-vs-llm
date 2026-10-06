@@ -14,6 +14,14 @@ benchmarks all use those packages. The second command reads the same selection,
 trains the re-ranker on **every remaining eligible package**, and benchmarks the
 four neural ranking strategies on the original 50 packages.
 
+Replace `50` with the number of packages you want. Re-ranking produces both
+`results-table-re-ranker.tex` and **`performance-re-ranker.png`** in
+`experiment/results/`. The separate image plots average completion time (ms)
+against average Pharo memory change per completion (MB) for the four re-rankers,
+for both Methods and Classes. It uses the already collected measurements and
+keeps the normal benchmark's `performance.png` separate. Memory here is the
+Pharo VM delta, not the Python scoring server's total RAM.
+
 Training uses a fixed number of epochs. Benchmark packages never enter training
 or validation, and test examples are collected into a separate file only after
 training. Training rejects rows from packages outside the saved training set.
