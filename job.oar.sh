@@ -31,7 +31,7 @@ export RESULTS_DIR="$RUN_DIR/results"
 export BENCHMARK_PACKAGE_COUNT="${BENCHMARK_PACKAGE_COUNT:-50}"
 export RANKING_SEED="${RANKING_SEED:-42}"
 export RANKING_EPOCHS="${RANKING_EPOCHS:-10}"
-export BENCHMARK_REF="${BENCHMARK_REF:-neural-ranking}"
+export BENCHMARK_REF="${BENCHMARK_REF:-main}"
 # BENCHMARK_REPO_DIR and RERANKER_PYTHON, if set, are inherited by the pipelines.
 
 OLLAMA_INSTALL_DIR="$RUN_DIR/ollama-bin"
