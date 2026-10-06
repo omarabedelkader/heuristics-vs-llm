@@ -19,8 +19,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ID="${OAR_JOB_ID:-manual-$(date '+%Y%m%d-%H%M%S')}"
 RUN_DIR="${RUN_DIR:-$ROOT_DIR/oar-runs/$RUN_ID}"
 
-IMAGE_DIR="$RUN_DIR/image"
-RESULTS_DIR="$RUN_DIR/results"
+# Keep paths stable when Ollama installation changes the working directory.
+case "$RUN_DIR" in
+    /*) ;;
+    *) RUN_DIR="$PWD/$RUN_DIR" ;;
+esac
+
+# Both pipelines share this image, package split and results directory.
+export EXPERIMENT_DIR="$RUN_DIR"
+export RESULTS_DIR="$RUN_DIR/results"
+export BENCHMARK_PACKAGE_COUNT="${BENCHMARK_PACKAGE_COUNT:-50}"
+export RANKING_SEED="${RANKING_SEED:-42}"
+export RANKING_EPOCHS="${RANKING_EPOCHS:-10}"
+export BENCHMARK_REF="${BENCHMARK_REF:-neural-ranking}"
+# BENCHMARK_REPO_DIR and RERANKER_PYTHON, if set, are inherited by the pipelines.
 
 OLLAMA_INSTALL_DIR="$RUN_DIR/ollama-bin"
 
@@ -433,74 +445,9 @@ log "============================================================"
 log "4-PULL MODELS OK"
 
 
-###############################################################################
-# 5. Download Pharo + VM
-###############################################################################
-
-log "============================================================"
-log "5. CREATING PHARO IMAGE"
-log "============================================================"
-
-
-mkdir -p "$IMAGE_DIR"
-
-cd "$IMAGE_DIR"
-
-
-curl -fsSL \
-    https://get.pharo.org/140+vm \
-    | bash
-
-
-###############################################################################
-# Check Pharo
-###############################################################################
-
-if [ ! -x "./pharo" ]; then
-
-    log "ERROR: Pharo executable was not created"
-
-    ls -lah
-
-    exit 1
-
-fi
-
-
-log "Pharo version:"
-
-./pharo --version || true
-
-
-log "5-DOWNLOAD PHARO OK"
-
-
-###############################################################################
-# 6. Install benchmark repository
-###############################################################################
-
-log "============================================================"
-log "6. INSTALLING BENCHMARK REPOSITORY"
-log "============================================================"
-
-
-cd "$IMAGE_DIR"
-
-
-./pharo Pharo.image eval --save "
-
-Metacello new
-    githubUser: 'omarabedelkader'
-    project: 'HeuristicCompletion-Benchmarks-Multiples'
-    commitish: 'main'
-    path: 'src';
-    baseline: 'ExtendedHeuristicCompletionBenchmarks';
-    load.
-
-"
-
-
-log "6-INSTALL REPOSITORY OK"
+# Pharo creation and benchmark installation are handled by pipeline-common.sh,
+# called by the pipelines below. It snapshots the local benchmark checkout when
+# available, otherwise downloads BENCHMARK_REF, and saves one shared split.
 
 
 ###############################################################################
@@ -534,27 +481,24 @@ log "Available models:"
 
 
 ###############################################################################
-# 8. Run benchmark
+# 8. Run normal benchmarks, then train and benchmark the re-ranker
 ###############################################################################
 
 log "============================================================"
 log "8. RUNNING BENCHMARKS"
 log "============================================================"
+log "Benchmark packages: $BENCHMARK_PACKAGE_COUNT; seed: $RANKING_SEED"
+log "Re-ranker epochs: $RANKING_EPOCHS; training uses all remaining packages"
+log "Shared experiment: $EXPERIMENT_DIR"
 
+# Use child shells so pipeline cleanup traps do not replace Ollama's cleanup.
+# Deploy all three pipeline-*.sh files alongside this job script.
+bash "$ROOT_DIR/pipeline-normal-bench.sh"
+log "NORMAL BENCHMARKS OK"
 
-cd "$IMAGE_DIR"
-
-
-./pharo Pharo.image eval --save "
-
-| comparison files |
-comparison := CooBenchRunner randomPackages: 40.
-files := CooBenchRunner
-    export: comparison
-    to: '$RESULTS_DIR'.
-files inspect.
-"
-
+bash "$ROOT_DIR/pipeline-re-ranker-bench.sh"
+log "RE-RANKER TRAINING AND BENCHMARKS OK"
+log "Re-ranker performance image: $RESULTS_DIR/performance-re-ranker.png"
 
 log "8-RUN BENCHMARKS OK"
 
