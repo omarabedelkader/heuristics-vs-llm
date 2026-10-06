@@ -1,5 +1,6 @@
 image/
 oar-runs/
 .ollama-models/
+experiment/
 *.err
 *.out

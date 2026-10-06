@@ -1,40 +1,13 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/pipeline-common.sh"
 
-echo "Creating Image"
-# 1. Download Pharo + VM
-mkdir -p image
-cd image
-curl -fsSL https://get.pharo.org/140+vm | bash
-
-echo "1-DOWNLOAD IMAGE OK"
-
-
-echo "Installation Repository"
-# 2. Install your repository into the image
-./pharo Pharo.image eval --save "
-Metacello new
-  githubUser: 'omarabedelkader' project: 'HeuristicCompletion-Benchmarks-Multiples' commitish: 'main' path: 'src';
-  baseline: 'ExtendedHeuristicCompletionBenchmarks';
-  load
-
+echo "Running normal benchmarks on the saved benchmark packages"
+./pharo --headless Pharo.image eval "
+| split comparison files |
+split := CooBenchmarkSplit readFrom: (OSEnvironment current at: 'BENCHMARK_SPLIT_FILE').
+comparison := CooBenchRunner normalBenchmarksForSplit: split.
+files := CooBenchRunner export: comparison to: (OSEnvironment current at: 'RESULTS_DIR').
+files do: [ :file | Stdio stdout nextPutAll: file fullName; lf ].
 "
-
-echo "2-INSTALL REPO OK"
-
-
-echo "Run Benchmark"
-# 3. Run the benchmarks
-./pharo Pharo.image eval --save "
-
-| comparison files |
-comparison := CooBenchRunner randomPackages: 40.
-files := CooBenchRunner
-    export: comparison
-    to: '/Users/omar/Desktop/HeuristicCompletion-Benchmarks-Multiples/benchmark-results'.
-files inspect.
-
-"
-
-
-echo "3-RUN BENCHMARKS OK"
+echo "Normal benchmarks complete: $RESULTS_DIR"
