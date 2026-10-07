@@ -53,8 +53,10 @@ root = Path(os.environ['TEST_ROOT'])
 code = sys.argv[-1]
 with (root / 'pharo-calls.jsonl').open('a') as out:
     out.write(json.dumps(dict(cwd=str(Path.cwd()), code=code)) + '\\n')
-packages = ['Package-A', 'Package-B', 'Package-C']
+packages = ['Package-A', 'Package-B', 'Package-C', 'Package-D', 'Package-E', 'Package-F']
 if 'exportRankingCorpusForPackages:' in code:
+    if os.environ.get('TEST_FAIL_MINING'):
+        sys.exit(23)
     directory = Path(os.environ['CORPUS_STAGE_DIR'])
     (directory / 'packages.json').write_text(json.dumps(packages))
     with (directory / 'all.jsonl').open('w') as out:
@@ -63,7 +65,7 @@ if 'exportRankingCorpusForPackages:' in code:
 elif 'benchmarkPackages:' in code:
     if os.environ.get('TEST_DIFFERENT_POOL'):
         packages.append('New-Package')
-    path = Path(os.environ['BENCHMARK_SPLIT_FILE'])
+    path = Path(os.environ['BENCHMARK_SELECTION_FILE'])
     (path.parent / 'llm-models.json').write_text(json.dumps(['model-05', 'model-15', 'model-3', 'model-7']))
     if not path.exists():
         benchmark = random.Random(42).sample(packages, 1)
@@ -76,7 +78,8 @@ elif 'coo-package-result-v1' in code:
     phase = os.environ['BENCHMARK_PHASE']
     package = os.environ['BENCHMARK_PACKAGE']
     split = json.loads(Path(os.environ['BENCHMARK_SPLIT_FILE']).read_text())
-    assert package in split['benchmark'] and package not in split['train']
+    assert package in split['benchmark']
+    assert all(package not in split[key] for key in ('train', 'validation', 'test'))
     assert Path.cwd().name == 'image' and Path.cwd().parent.parent.name == 'packages'
     assert (Path.cwd() / 'Pharo.image').exists()
     if phase == 'reranker' and os.environ.get('TEST_FAIL_RERANKER'):
@@ -95,9 +98,10 @@ elif 'CooPipelineStatistics' in code:
     (publication / 'results-table.tex').write_text('Baseline Dependency LLM 05 15 3 7 Hybrid 05 15 3 7')
     (publication / 'performance.png').write_bytes(b'normal performance image')
     (publication / 'dataset-summary.tex').write_text('Packages: 1 Classes: 2 Methods: 3')
-    (publication / 'results-table-re-ranker.tex').write_text('NeuralRank 10 20 30 50')
-    if not os.environ.get('TEST_MISSING_FIGURE'):
-        (publication / 'performance-re-ranker.png').write_bytes(b'reranker performance image')
+    if 'reranker' in data:
+        (publication / 'results-table-re-ranker.tex').write_text('NeuralRank 10 20 30 50')
+        if not os.environ.get('TEST_MISSING_FIGURE'):
+            (publication / 'performance-re-ranker.png').write_bytes(b'reranker performance image')
     (root / 'benchmark-complete').touch()
 elif 'Metacello new' not in code:
     raise SystemExit('Unexpected Pharo call: ' + code)
@@ -110,27 +114,46 @@ args = sys.argv[1:]
 root = Path(os.environ['TEST_ROOT'])
 if args[:2] == ['-m', 'pip']:
     sys.exit(0)
-if Path(args[0]).name == 'train.py':
-    split = json.loads(Path(args[args.index('--package-split') + 1]).read_text())
-    rows = [json.loads(line) for line in Path(args[1]).read_text().splitlines()]
-    assert {row['group'] for row in rows} == set(split['train'])
-    assert not ({row['group'] for row in rows} & set(split['benchmark']))
-    model = Path(args[2])
-    model.mkdir()
-    (model / 'ranker.onnx').write_bytes(b'model')
-    (model / 'metadata.json').write_text(json.dumps(dict(packageSplit=split)))
-    with (root / 'training-calls').open('a') as out:
-        out.write('train\\n')
-    (root / 'trainer-checked').touch()
-    sys.exit(0)
-if Path(args[0]).name == 'evaluate.py':
-    assert (root / 'trainer-checked').exists()
-    split = json.loads((Path(os.environ['EXPERIMENT_DIR']) / 'split.json').read_text())
-    rows = [json.loads(line) for line in Path(args[2]).read_text().splitlines()]
-    assert {row['group'] for row in rows} == set(split['benchmark'])
-    print('[]')
+if Path(args[0]).name == 'reranker_workflow.py':
+    action = args[1]
+    if action == 'train':
+        split = json.loads(Path(args[args.index('--split') + 1]).read_text())
+        assert '--data' not in args
+        for key, option in [('train', '--training'), ('validation', '--validation')]:
+            rows = [json.loads(line) for line in Path(args[args.index(option) + 1]).read_text().splitlines()]
+            assert {row['group'] for row in rows} == set(split[key])
+            assert not ({row['group'] for row in rows} & set(split['benchmark'] + split['test']))
+        run = Path(os.environ['RERANKER_RUN_DIR'])
+        assert (run / 'packages/0001/normal.json').exists(), 'Normal benchmarks must precede training'
+        if os.environ.get('TEST_FAIL_TRAINING'):
+            sys.exit(25)
+        model = Path(args[args.index('--output') + 1])
+        model.mkdir(exist_ok=True)
+        (model / 'ranker.onnx').write_bytes(b'model')
+        (model / 'metadata.json').write_text(json.dumps(dict(packageSplit=split)))
+        (model / 'learning-history.json').write_text('{}')
+        with (root / 'training-calls').open('a') as out:
+            out.write('train\\n')
+        (root / 'trainer-checked').touch()
+    elif action == 'evaluate':
+        assert (root / 'trainer-checked').exists()
+        split = json.loads(Path(args[args.index('--split') + 1]).read_text())
+        rows = [json.loads(line) for line in Path(args[args.index('--data') + 1]).read_text().splitlines()]
+        assert {row['group'] for row in rows} == set(split['test'])
+        assert not ({row['group'] for row in rows} & set(split['benchmark']))
+        Path(args[args.index('--output') + 1]).write_text('{}')
+    elif action == 'report':
+        directory = Path(args[args.index('--output') + 1])
+        directory.mkdir(exist_ok=True)
+        for name in ('learning-curves', 'test-performance', 'test-rank-transitions'):
+            for extension in ('png', 'pdf'):
+                (directory / (name + '.' + extension)).write_bytes(b'figure')
+    else:
+        raise AssertionError(action)
     sys.exit(0)
 if Path(args[0]).name == 'serve.py':
+    with (root / 'reranker-server-calls').open('a') as out:
+        out.write('serve\\n')
     time.sleep(30)
     sys.exit(0)
 # Stub only the HTTP readiness test, leaving the source validation script real.
@@ -156,8 +179,8 @@ time.sleep(30)
         path.write_text(f"#!{sys.executable}\n" + body)
         path.chmod(0o755)
 
-    def run_script(self, name, expected=0):
-        result = subprocess.run(["bash", str(ROOT / name)], env=self.env,
+    def run_script(self, name, expected=0, args=()):
+        result = subprocess.run(["bash", str(ROOT / name), *args], env=self.env,
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         for directory in (self.mining, self.experiment):
@@ -168,6 +191,41 @@ time.sleep(30)
     def test_exactly_two_shell_entry_points(self):
         self.assertEqual(sorted(p.name for p in ROOT.glob('*.sh')),
                          ['pipeline-benchmarks.sh', 'pipeline-mine-training-data.sh'])
+
+    def test_help_and_unknown_options_before_any_work(self):
+        self.env.pop('BENCHMARK_JOBS')
+        result = self.run_script('pipeline-benchmarks.sh', args=['--help'])
+        self.assertIn('--skip-reranker-benchmarks', result.stdout)
+        result = self.run_script('pipeline-benchmarks.sh', 2, args=['--unknown'])
+        self.assertIn('Unknown option', result.stderr)
+        self.assertFalse((self.root / 'downloads').exists())
+
+    def test_skip_reranker_benchmarks_keeps_training_and_removes_stale_neural_outputs(self):
+        self.run_script('pipeline-benchmarks.sh')
+        runs = set(self.experiment.glob('reranker-run.*'))
+        self.env['TEST_FAIL_RERANKER'] = '1'
+        result = self.run_script('pipeline-benchmarks.sh', args=['--skip-reranker-benchmarks'])
+        self.assertIn('Skipping live neural', result.stdout)
+        run = (set(self.experiment.glob('reranker-run.*')) - runs).pop()
+        self.assertTrue((run / 'training-ready').exists())
+        self.assertTrue((run / 'evaluation.json').is_file())
+        self.assertEqual(len(list((run / 'learning').glob('*.png'))), 3)
+        self.assertFalse((run / 'packages/0001/reranker.json').exists())
+        self.assertEqual((self.root / 'reranker-server-calls').read_text().splitlines(), ['serve'])
+        self.assertEqual({p.name for p in (self.root / 'resutls').iterdir()},
+                         {'results-table.tex', 'performance.png', 'dataset-summary.tex'})
+
+    def test_resume_without_skip_flag_adds_neural_benchmarks_without_retraining(self):
+        self.run_script('pipeline-benchmarks.sh', args=['--skip-reranker-benchmarks'])
+        run = next(self.experiment.glob('reranker-run.*'))
+        saved = (run / 'packages/0001/normal.json').read_bytes()
+        self.assertFalse((self.root / 'reranker-server-calls').exists())
+        self.env['BENCHMARK_RESUME_DIR'] = str(run)
+        self.run_script('pipeline-benchmarks.sh')
+        self.assertEqual((run / 'packages/0001/normal.json').read_bytes(), saved)
+        self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['train'])
+        self.assertTrue((run / 'packages/0001/reranker.json').exists())
+        self.assertEqual(len(list((self.root / 'resutls').iterdir())), 5)
 
     def test_job_count_must_be_explicit_and_positive(self):
         for value in ('', '0', '-1', 'auto', '2.5'):
@@ -191,10 +249,63 @@ time.sleep(30)
         calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
         self.assertEqual(sum('coo-package-result-v1' in c['code'] for c in calls), 3)
 
-    def test_missing_corpus_fails_before_downloads(self):
-        result = self.run_script('pipeline-benchmarks.sh', 1)
-        self.assertIn('pipeline-mine-training-data.sh', result.stderr)
+    def test_training_failure_preserves_normal_checkpoints_for_resume(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        self.env['TEST_FAIL_TRAINING'] = '1'
+        self.run_script('pipeline-benchmarks.sh', 1)
+        run = next(self.experiment.glob('reranker-run.*'))
+        saved = (run / 'packages/0001/normal.json').read_bytes()
+        self.assertFalse((run / 'training-ready').exists())
+        self.assertFalse((run / 'model-inputs.json').exists())
+        self.env.pop('TEST_FAIL_TRAINING')
+        self.env['BENCHMARK_RESUME_DIR'] = str(run)
+        self.run_script('pipeline-benchmarks.sh')
+        self.assertEqual((run / 'packages/0001/normal.json').read_bytes(), saved)
+        self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['train'])
+        self.assertEqual(len(list((run / 'learning').glob('*.png'))), 3)
+        self.assertEqual(len(list((run / 'learning').glob('*.pdf'))), 3)
+
+    def test_missing_corpus_is_mined_automatically_then_reused(self):
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assertIn('Running pipeline-mine-training-data.sh', result.stdout)
+        self.assertTrue((self.mining / 'corpus/manifest.json').is_file())
+        self.assertTrue((self.root / 'benchmark-complete').exists())
+        saved = (self.mining / 'corpus/all.jsonl').read_bytes()
+        self.run_script('pipeline-benchmarks.sh')
+        self.assertEqual((self.mining / 'corpus/all.jsonl').read_bytes(), saved)
+        calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
+        self.assertEqual(sum('exportRankingCorpusForPackages:' in c['code'] for c in calls), 1)
+        self.assertEqual((self.root / 'downloads').read_text().splitlines(),
+                         [str(self.mining / 'image'), str(self.experiment / 'image')])
+
+    def test_failed_automatic_mining_stops_before_benchmarks(self):
+        self.env['TEST_FAIL_MINING'] = '1'
+        self.run_script('pipeline-benchmarks.sh', 23)
+        self.assertFalse((self.mining / 'corpus/manifest.json').exists())
+        self.assertFalse((self.experiment / 'image').exists())
+        self.assertFalse((self.root / 'trainer-checked').exists())
+
+    def test_existing_mining_lock_is_preserved_without_duplicate_work(self):
+        lock = self.mining / '.running'
+        lock.mkdir(parents=True)
+        result = subprocess.run(['bash', str(ROOT / 'pipeline-benchmarks.sh')], env=self.env,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('Mining is already running', result.stderr)
+        self.assertTrue(lock.is_dir())
+        self.assertFalse((self.experiment / '.running').exists())
+        self.assertFalse((self.root / 'resutls/.running').exists())
         self.assertFalse((self.root / 'downloads').exists())
+
+    def test_invalid_saved_corpus_is_not_remined_or_overwritten(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        path = self.mining / 'corpus/all.jsonl'
+        path.write_text('corrupted data\n')
+        calls = (self.root / 'pharo-calls.jsonl').read_bytes()
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn('checksum mismatch', result.stderr)
+        self.assertEqual(path.read_text(), 'corrupted data\n')
+        self.assertEqual((self.root / 'pharo-calls.jsonl').read_bytes(), calls)
 
     def test_two_downloads_and_saved_data_survives_removing_mining_image(self):
         self.run_script('pipeline-mine-training-data.sh')

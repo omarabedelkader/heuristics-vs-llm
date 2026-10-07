@@ -35,7 +35,13 @@ class PackageWorkerTests(unittest.TestCase):
         (self.image / "Pharo.sources").write_bytes(b"sources")
         (self.run / "model/ranker.onnx").write_bytes(b"onnx")
         (self.run / "model/metadata.json").write_text("{}")
-        workers.atomic_json(self.run / "split.json", dict(benchmark=["A", "B", "C"]))
+        split = dict(schema="coo-package-split-v2", seed=42, eligible=["A", "B", "C", "Train", "Validation", "Test"],
+                     train=["Train"], validation=["Validation"], test=["Test"], benchmark=["A", "B", "C"])
+        workers.atomic_json(self.run / "split.json", split)
+        workers.atomic_json(self.run / "model/metadata.json", dict(packageSplit=split))
+        (self.run / "training-config.json").write_text('{"epochs": 10}')
+        for name in ("training", "validation", "test"):
+            (self.run / f"{name}.jsonl").write_text('{}')
         (self.run / "corpus.json").write_text("{}")
         self.manifest = workers.prepare(self.run, self.image)
 
@@ -75,7 +81,21 @@ class PackageWorkerTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             workers.aggregate(self.run, self.image)
 
+    def test_normal_only_aggregation_does_not_require_or_include_neural_results(self):
+        self.checkpoints()
+        data = workers.read_json(workers.aggregate(self.run, self.image, normal_only=True))
+        self.assertNotIn('reranker', data)
+        for index in range(3):
+            (workers.package_directory(self.run, index) / 'reranker.json').unlink()
+        self.assertEqual(workers.read_json(workers.aggregate(self.run, self.image, normal_only=True)), data)
+        self.assertEqual(data['benchmarkPhases'], ['normal'])
+        self.assertEqual(data['corpus'], dict(packages=3, classes=6, methods=9))
+        self.assertEqual(data['normal'][0]['count'], 10)
+        with self.assertRaises(FileNotFoundError):
+            workers.aggregate(self.run, self.image)
+
     def test_changed_model_rejected_on_resume(self):
+        workers.pin_model(self.run)
         (self.run / "model/ranker.onnx").write_bytes(b"different model")
         with self.assertRaisesRegex(ValueError, "Resume inputs changed"):
             workers.prepare(self.run, self.image)

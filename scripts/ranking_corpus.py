@@ -3,6 +3,7 @@ import argparse
 from contextlib import ExitStack
 import hashlib
 import json
+import random
 from pathlib import Path
 import sys
 import tempfile
@@ -50,22 +51,72 @@ def package_names(value, label):
     return set(value)
 
 
-def load_split(path, eligible):
-    split = read_json(path)
-    if split.get("schema") != "coo-package-split-v1" or type(split.get("seed")) is not int:
-        raise ValueError("Invalid package split schema or seed")
-    pools = {key: package_names(split.get(key), key)
-             for key in ("eligible", "train", "benchmark")}
-    if pools["eligible"] != eligible:
+PARTITIONS = ("train", "validation", "test", "benchmark")
+FILES = {"train": "training", "validation": "validation", "test": "test"}
+
+
+def validate_split(split, eligible=None):
+    if split.get("schema") != "coo-package-split-v2" or type(split.get("seed")) is not int:
+        raise ValueError("A four-part coo-package-split-v2 split is required; use a new EXPERIMENT_DIR for older runs")
+    pools = {key: package_names(split.get(key), key) for key in ("eligible", *PARTITIONS)}
+    if eligible is not None and pools["eligible"] != eligible:
         raise ValueError("Saved split and prepared corpus have different package pools")
-    if pools["train"] & pools["benchmark"]:
-        raise ValueError("Benchmark packages must never enter training")
-    if pools["train"] | pools["benchmark"] != eligible:
-        raise ValueError("Training must contain every remaining eligible package")
+    seen = set()
+    for key in PARTITIONS:
+        if seen & pools[key]:
+            raise ValueError("Train, validation, test and benchmark packages must be mutually disjoint")
+        seen.update(pools[key])
+    if seen != pools["eligible"]:
+        raise ValueError("The four partitions must contain every eligible package exactly once")
     return split
 
 
-def scan_rows(path, eligible, train=None, outputs=None):
+def load_split(path, eligible=None):
+    return validate_split(read_json(path), eligible)
+
+
+def create_split(corpus, selection_path, output, ratios=(80, 10, 10)):
+    """Reserve the saved benchmark selection, then split only the remaining packages."""
+    _, eligible = load_manifest(corpus)
+    selection = read_json(selection_path)
+    if package_names(selection.get("eligible"), "selection eligible") != eligible:
+        raise ValueError("Saved selection and prepared corpus have different package pools")
+    benchmark = package_names(selection.get("benchmark"), "selection benchmark")
+    if not benchmark < eligible or type(selection.get("seed")) is not int:
+        raise ValueError("Invalid benchmark selection or seed")
+    if len(ratios) != 3 or any(type(n) is not int or n <= 0 for n in ratios) or sum(ratios) != 100:
+        raise ValueError("RANKING_SPLIT_RATIOS must be three positive percentages summing to 100")
+    if output.exists():
+        split = load_split(output, eligible)
+        if (set(split["benchmark"]) != benchmark or split["seed"] != selection["seed"]
+                or split.get("ratios") != list(ratios)):
+            raise ValueError("Saved split differs from selection or ratios; use a new EXPERIMENT_DIR")
+        return split
+    remaining = sorted(eligible - benchmark)
+    if len(remaining) < 3:
+        raise ValueError("Reserve at least three non-benchmark packages for train, validation and test")
+    random.Random(selection["seed"]).shuffle(remaining)
+    # Largest-remainder allocation, with at least one package in every ML partition.
+    exact = [len(remaining) * n / 100 for n in ratios]
+    counts = [int(n) for n in exact]
+    for index in sorted(range(3), key=lambda i: (-(exact[i] - counts[i]), i))[:len(remaining) - sum(counts)]:
+        counts[index] += 1
+    for index in range(3):
+        if counts[index] == 0:
+            donor = max(range(3), key=lambda i: counts[i])
+            counts[donor] -= 1
+            counts[index] = 1
+    train_end, validation_end = counts[0], counts[0] + counts[1]
+    split = dict(schema="coo-package-split-v2", seed=selection["seed"], ratios=list(ratios),
+                 eligible=sorted(eligible), benchmark=selection["benchmark"],
+                 train=sorted(remaining[:train_end]), validation=sorted(remaining[train_end:validation_end]),
+                 test=sorted(remaining[validation_end:]))
+    validate_split(split, eligible)
+    write_json(output, split)
+    return split
+
+
+def scan_rows(path, eligible, destinations=None, outputs=None):
     """Stream the corpus; retain zero-row packages and hash the exact input bytes."""
     counts = dict.fromkeys(sorted(eligible), 0)
     digest = hashlib.sha256()
@@ -85,8 +136,8 @@ def scan_rows(path, eligible, train=None, outputs=None):
             if row.get("schema") != "coo-ranking-v1":
                 raise ValueError(f"Row {number}: unsupported ranking schema")
             counts[group] += 1
-            if outputs is not None:
-                outputs["training" if group in train else "test"].write(line.rstrip(b"\r\n") + b"\n")
+            if outputs is not None and group in destinations:
+                outputs[destinations[group]].write(line.rstrip(b"\r\n") + b"\n")
     if not sum(counts.values()):
         raise ValueError("Empty prepared corpus")
     return counts, digest.hexdigest()
@@ -136,9 +187,9 @@ def verify(corpus, image=None, split_path=None, repository=None):
 def partition(corpus, image, split_path, output, repository=None):
     manifest, eligible = load_manifest(corpus, image, repository)
     split = load_split(split_path, eligible)
-    train = set(split["train"])
+    destinations = {name: FILES[key] for key in FILES for name in split[key]}
     output.mkdir(parents=True, exist_ok=True)
-    for name in ("training.jsonl", "test.jsonl", "corpus.json"):
+    for name in ("training.jsonl", "validation.jsonl", "test.jsonl", "corpus.json"):
         if (output / name).exists():
             raise ValueError(f"Refusing to overwrite {output / name}; use a fresh run directory")
     # No training file becomes visible until every row and the checksum pass.
@@ -146,35 +197,46 @@ def partition(corpus, image, split_path, output, repository=None):
         stage = Path(temporary)
         with ExitStack() as stack:
             outputs = {name: stack.enter_context((stage / f"{name}.jsonl").open("wb"))
-                       for name in ("training", "test")}
-            counts, digest = scan_rows(corpus / "all.jsonl", eligible, train, outputs)
+                       for name in FILES.values()}
+            counts, digest = scan_rows(corpus / "all.jsonl", eligible, destinations, outputs)
         if digest != manifest.get("corpusSHA256") or counts != manifest["rowsByPackage"]:
             raise ValueError("Prepared corpus checksum/count mismatch; restore the complete corpus")
-        training_rows = sum(counts[name] for name in train)
-        test_rows = sum(counts[name] for name in split["benchmark"])
-        if not training_rows or not test_rows:
-            raise ValueError("Saved split must have nonempty training and test data; no packages were redrawn")
-        audit = dict(manifest, packageSplit=split, trainingRows=training_rows, testRows=test_rows)
+        row_counts = {key: sum(counts[name] for name in split[key]) for key in PARTITIONS}
+        if any(row_counts[key] == 0 for key in FILES):
+            raise ValueError("Saved split must have nonempty train, validation and test data; no packages were redrawn")
+        audit = dict(manifest, packageSplit=split, trainingRows=row_counts["train"],
+                     validationRows=row_counts["validation"], testRows=row_counts["test"],
+                     excludedBenchmarkRows=row_counts["benchmark"])
+        audit["partitionSHA256"] = {name: sha256(stage / f"{name}.jsonl") for name in FILES.values()}
         write_json(stage / "corpus.json", audit)
-        for name in ("training.jsonl", "test.jsonl", "corpus.json"):
+        for name in ("training.jsonl", "validation.jsonl", "test.jsonl", "corpus.json"):
             (stage / name).replace(output / name)
     return audit
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("finalize", "verify", "partition"))
+    parser.add_argument("action", choices=("finalize", "verify", "partition", "split"))
     parser.add_argument("corpus", type=Path)
     parser.add_argument("--image", type=Path, help="Mining image: required for finalize; optional provenance check otherwise")
     parser.add_argument("--repository", type=Path, help="Frozen source used by both independent images")
     parser.add_argument("--split", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--selection", type=Path)
+    parser.add_argument("--ratios", default="80,10,10")
     args = parser.parse_args()
     if args.action == "finalize" and args.image is None:
         parser.error("finalize requires --image")
     if args.action == "partition" and (args.split is None or args.output is None):
         parser.error("partition requires --split and --output")
+    if args.action == "split" and (args.selection is None or args.output is None):
+        parser.error("split requires --selection and --output")
     try:
+        if args.action == "split":
+            result = create_split(args.corpus, args.selection, args.output,
+                                  tuple(int(n) for n in args.ratios.split(",")))
+            print("Package partitions: " + ", ".join(f"{key}={len(result[key])}" for key in PARTITIONS))
+            return 0
         if args.action == "finalize":
             result = finalize(args.corpus, args.image, args.repository)
         elif args.action == "verify":
@@ -186,7 +248,8 @@ def main():
         return 1
     print(f"Corpus {args.action}: {result['rows']} rows across {len(result['eligible'])} packages")
     if args.action == "partition":
-        print(f"Training: {result['trainingRows']} rows; held-out test: {result['testRows']} rows")
+        print(f"Training: {result['trainingRows']}; validation: {result['validationRows']}; "
+              f"test: {result['testRows']}; excluded benchmark rows: {result['excludedBenchmarkRows']}")
     return 0
 
 

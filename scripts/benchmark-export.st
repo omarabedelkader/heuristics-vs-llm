@@ -38,6 +38,7 @@ makeComparison := [ :phase :strategies |
         comparison at: kind put: { { runClass new results: results; yourself } } ].
     comparison ].
 normal := makeComparison value: 'normal' value: CooBenchmarkChart publicationStrategies.
-reranker := makeComparison value: 'reranker' value: CooBenchmarkChart rerankerStrategies.
 CooBenchRunner export: normal to: (OSEnvironment current at: 'PUBLICATION_DIR').
-CooBenchRunner exportReranker: reranker to: (OSEnvironment current at: 'PUBLICATION_DIR').
+(data includesKey: 'reranker') ifTrue: [
+    reranker := makeComparison value: 'reranker' value: CooBenchmarkChart rerankerStrategies.
+    CooBenchRunner exportReranker: reranker to: (OSEnvironment current at: 'PUBLICATION_DIR') ].

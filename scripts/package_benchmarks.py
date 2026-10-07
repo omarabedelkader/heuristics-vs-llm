@@ -11,7 +11,7 @@ import sys
 import time
 import uuid
 
-from ranking_corpus import read_json, sha256
+from ranking_corpus import load_split, read_json, sha256
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -37,7 +37,7 @@ def positive_jobs(value):
 
 def prepare(run, image):
     """Pin every input needed to safely reuse a completed package checkpoint."""
-    split = read_json(run / "split.json")
+    split = load_split(run / "split.json")
     packages = split["benchmark"]
     if not packages or len(set(packages)) != len(packages):
         raise ValueError("Empty or duplicate benchmark packages")
@@ -45,22 +45,42 @@ def prepare(run, image):
         "split": sha256(run / "split.json"),
         "corpus": sha256(run / "corpus.json"),
         "image": sha256(image / "Pharo.image"),
-        "model": {p.name: sha256(p) for p in sorted((run / "model").iterdir()) if p.is_file()},
+        "trainingConfig": sha256(run / "training-config.json"),
+        "partitions": {name: sha256(run / f"{name}.jsonl") for name in ("training", "validation", "test")},
         "scripts": {name: sha256(SCRIPTS / name) for name in (
-            "package_benchmarks.py", "benchmark-package.st", "benchmark-export.st")},
+            "package_benchmarks.py", "benchmark-package.st", "benchmark-export.st",
+            "ranking_corpus.py", "reranker_workflow.py")},
     }
-    if "ranker.onnx" not in inputs["model"] or "metadata.json" not in inputs["model"]:
-        raise ValueError("Missing trained model or metadata; cannot checkpoint this run")
+    if (run / "model-inputs.json").exists():
+        pin_model(run)
     manifest = run / "workers.json"
     if manifest.exists():
         saved = read_json(manifest)
         if saved["inputs"] != inputs or saved["packages"] != packages:
             raise ValueError("Resume inputs changed (split, corpus, image, model or worker scripts); use a new run")
         return saved
-    saved = dict(schema="coo-package-workers-v1", runId=uuid.uuid4().hex,
+    saved = dict(schema="coo-package-workers-v2", runId=uuid.uuid4().hex,
                  inputs=inputs, packages=packages)
     atomic_json(manifest, saved)
     return saved
+
+
+def pin_model(run):
+    """Bind re-ranker checkpoints to the model produced after the normal phase."""
+    split = load_split(run / "split.json")
+    directory = run / "model"
+    metadata = read_json(directory / "metadata.json")
+    if metadata.get("packageSplit") != split:
+        raise ValueError("Trained model must record the same four-part package split")
+    inputs = {p.name: sha256(p) for p in sorted(directory.iterdir()) if p.is_file()}
+    if "ranker.onnx" not in inputs:
+        raise ValueError("Missing trained model")
+    path = run / "model-inputs.json"
+    if path.exists() and read_json(path) != inputs:
+        raise ValueError("Resume inputs changed: trained model differs from saved re-ranker checkpoints")
+    if not path.exists():
+        atomic_json(path, inputs)
+    return inputs
 
 
 def row_keys(phase):
@@ -133,6 +153,8 @@ def stop_processes(active):
 
 def run_workers(run, image, phase, jobs):
     manifest = prepare(run, image)
+    if phase == "reranker":
+        pin_model(run)
     pending = []
     for index, package in enumerate(manifest["packages"]):
         directory = package_directory(run, index)
@@ -190,16 +212,20 @@ def run_workers(run, image, phase, jobs):
         stop_processes(active)
 
 
-def aggregate(run, image):
+def aggregate(run, image, normal_only=False):
     manifest = prepare(run, image)
-    combined = dict(packages=manifest["packages"], corpus=dict(packages=0, classes=0, methods=0))
-    totals = {phase: {} for phase in STRATEGIES}
+    phases = ("normal",) if normal_only else tuple(STRATEGIES)
+    if not normal_only:
+        pin_model(run)
+    combined = dict(packages=manifest["packages"], benchmarkPhases=list(phases),
+                    corpus=dict(packages=0, classes=0, methods=0))
+    totals = {phase: {} for phase in phases}
     for index, package in enumerate(manifest["packages"]):
         results = {phase: validate_result(package_directory(run, index) / f"{phase}.json",
                                          package, phase, manifest["runId"])
-                   for phase in STRATEGIES}
+                   for phase in phases}
         corpus = results["normal"]["corpus"]
-        if corpus != results["reranker"]["corpus"]:
+        if "reranker" in results and corpus != results["reranker"]["corpus"]:
             raise ValueError(f"Normal and re-ranker corpus counts differ for {package}")
         for key, value in corpus.items():
             combined["corpus"][key] += value
@@ -210,7 +236,7 @@ def aggregate(run, image):
                                                            **dict.fromkeys(TOTALS, 0)))
                 for field in TOTALS:
                     target[field] += row[field]
-    for phase in STRATEGIES:
+    for phase in phases:
         combined[phase] = list(totals[phase].values())
     path = run / "aggregate.json"
     atomic_json(path, combined)
@@ -223,22 +249,28 @@ def interrupted(signum, _frame):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "run", "aggregate"))
+    parser.add_argument("action", choices=("prepare", "pin-model", "run", "aggregate"))
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--phase", choices=tuple(STRATEGIES))
     parser.add_argument("--jobs", type=positive_jobs)
+    parser.add_argument("--normal-only", action="store_true", help="Aggregate only normal benchmarks")
     args = parser.parse_args()
     if args.action == "run" and (args.phase is None or args.jobs is None):
         parser.error("run requires --phase and --jobs (no automatic concurrency)")
+    if args.normal_only and args.action != "aggregate":
+        parser.error("--normal-only applies only to aggregate")
     signal.signal(signal.SIGTERM, interrupted)
     try:
         if args.action == "prepare":
             prepare(args.run.resolve(), args.image.resolve())
+        elif args.action == "pin-model":
+            prepare(args.run.resolve(), args.image.resolve())
+            pin_model(args.run.resolve())
         elif args.action == "run":
             run_workers(args.run.resolve(), args.image.resolve(), args.phase, args.jobs)
         else:
-            print(aggregate(args.run.resolve(), args.image.resolve()))
+            print(aggregate(args.run.resolve(), args.image.resolve(), args.normal_only))
     except KeyboardInterrupt:
         return 130
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
