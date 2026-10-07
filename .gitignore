@@ -2,6 +2,9 @@ image/
 oar-runs/
 .ollama-models/
 experiment/
+mining/
+resutls/
 experiment-necompletion-smoke/
 *.err
 *.out
+__pycache__/
