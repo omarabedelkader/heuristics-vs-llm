@@ -28,7 +28,7 @@ class PipelineTests(unittest.TestCase):
         binaries.mkdir()
         self.env = {**os.environ, "MINING_DIR": str(self.mining),
                     "EXPERIMENT_DIR": str(self.experiment), "BENCHMARK_REPO_DIR": str(source),
-                    "BENCHMARK_PACKAGE_COUNT": "1", "RANKING_SEED": "42",
+                    "BENCHMARK_PACKAGE_COUNT": "1", "BENCHMARK_JOBS": "2", "RANKING_SEED": "42",
                     "RESULTS_DIR": str(self.root / "resutls"),
                     "TEST_ROOT": str(self.root), "PATH": str(binaries) + os.pathsep + os.environ['PATH']}
         self.env.pop("RERANKER_PYTHON", None)
@@ -70,21 +70,31 @@ elif 'benchmarkPackages:' in code:
         path.write_text(json.dumps(dict(schema='coo-package-split-v1', seed=42,
             eligible=packages, benchmark=benchmark,
             train=[name for name in packages if name not in benchmark])))
-elif 'normalBenchmarksForSplit:' in code:
-    run = Path(os.environ['RERANKER_RUN_DIR'])
-    assert (run / 'split.json').read_bytes() == Path(os.environ['BENCHMARK_SPLIT_FILE']).read_bytes()
-    (root / 'normal-split.json').write_bytes((run / 'split.json').read_bytes())
+elif 'coo-package-result-v1' in code:
+    sys.path.insert(0, os.environ['PIPELINE_SCRIPTS'])
+    from package_benchmarks import STRATEGIES
+    phase = os.environ['BENCHMARK_PHASE']
+    package = os.environ['BENCHMARK_PACKAGE']
+    split = json.loads(Path(os.environ['BENCHMARK_SPLIT_FILE']).read_text())
+    assert package in split['benchmark'] and package not in split['train']
+    assert Path.cwd().name == 'image' and Path.cwd().parent.parent.name == 'packages'
+    assert (Path.cwd() / 'Pharo.image').exists()
+    if phase == 'reranker' and os.environ.get('TEST_FAIL_RERANKER'):
+        sys.exit(24)
+    rows = [dict(kind=kind, strategy=strategy, prefix=prefix, count=2,
+                 reciprocalRankSum=1.0, timeMs=4.0, memoryBytes=-2.0)
+            for kind in ('messages', 'variables') for strategy in STRATEGIES[phase]
+            for prefix in range(2, 9)]
+    Path(os.environ['BENCHMARK_OUTPUT']).write_text(json.dumps(dict(
+        schema='coo-package-result-v1', package=package, phase=phase,
+        runId=os.environ['BENCHMARK_RUN_ID'], corpus=dict(packages=1, classes=2, methods=3), rows=rows)))
+elif 'CooPipelineStatistics' in code:
+    data = json.loads(Path(os.environ['BENCHMARK_AGGREGATE']).read_text())
+    assert data['corpus'] == dict(packages=1, classes=2, methods=3)
     publication = Path(os.environ['PUBLICATION_DIR'])
     (publication / 'results-table.tex').write_text('Baseline Dependency LLM 05 15 3 7 Hybrid 05 15 3 7')
     (publication / 'performance.png').write_bytes(b'normal performance image')
     (publication / 'dataset-summary.tex').write_text('Packages: 1 Classes: 2 Methods: 3')
-    (run / 'benchmark-corpus.json').write_text(json.dumps(dict(packages=1, classes=2, methods=3)))
-elif 'rerankerBenchmarksForSplit:' in code:
-    assert (root / 'trainer-checked').exists()
-    assert (root / 'normal-split.json').read_bytes() == Path(os.environ['BENCHMARK_SPLIT_FILE']).read_bytes()
-    if os.environ.get('TEST_FAIL_RERANKER'):
-        sys.exit(24)
-    publication = Path(os.environ['PUBLICATION_DIR'])
     (publication / 'results-table-re-ranker.tex').write_text('NeuralRank 10 20 30 50')
     if not os.environ.get('TEST_MISSING_FIGURE'):
         (publication / 'performance-re-ranker.png').write_bytes(b'reranker performance image')
@@ -105,6 +115,12 @@ if Path(args[0]).name == 'train.py':
     rows = [json.loads(line) for line in Path(args[1]).read_text().splitlines()]
     assert {row['group'] for row in rows} == set(split['train'])
     assert not ({row['group'] for row in rows} & set(split['benchmark']))
+    model = Path(args[2])
+    model.mkdir()
+    (model / 'ranker.onnx').write_bytes(b'model')
+    (model / 'metadata.json').write_text(json.dumps(dict(packageSplit=split)))
+    with (root / 'training-calls').open('a') as out:
+        out.write('train\\n')
     (root / 'trainer-checked').touch()
     sys.exit(0)
 if Path(args[0]).name == 'evaluate.py':
@@ -123,6 +139,7 @@ if args[0] == '-' and len(args) == 3:
 os.execv(sys.executable, [sys.executable, *args])
 ''')
         self.env['RERANKER_PYTHON'] = str(python)
+        self.env['PIPELINE_SCRIPTS'] = str(ROOT / 'scripts')
         ollama = self.root / 'ollama-stand-in'
         self.executable(ollama, '''
 import os, time
@@ -152,6 +169,28 @@ time.sleep(30)
         self.assertEqual(sorted(p.name for p in ROOT.glob('*.sh')),
                          ['pipeline-benchmarks.sh', 'pipeline-mine-training-data.sh'])
 
+    def test_job_count_must_be_explicit_and_positive(self):
+        for value in ('', '0', '-1', 'auto', '2.5'):
+            self.env['BENCHMARK_JOBS'] = value
+            result = self.run_script('pipeline-benchmarks.sh', 1)
+            self.assertIn('BENCHMARK_JOBS', result.stderr)
+            self.assertFalse((self.root / 'downloads').exists())
+
+    def test_resume_uses_same_model_and_completed_package_results(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        self.env['TEST_FAIL_RERANKER'] = '1'
+        self.run_script('pipeline-benchmarks.sh', 1)
+        run = next(self.experiment.glob('reranker-run.*'))
+        saved = (run / 'packages/0001/normal.json').read_bytes()
+        self.env.pop('TEST_FAIL_RERANKER')
+        self.env['BENCHMARK_RESUME_DIR'] = str(run)
+        self.env['BENCHMARK_JOBS'] = '1'
+        self.run_script('pipeline-benchmarks.sh')
+        self.assertEqual((run / 'packages/0001/normal.json').read_bytes(), saved)
+        self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['train'])
+        calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
+        self.assertEqual(sum('coo-package-result-v1' in c['code'] for c in calls), 3)
+
     def test_missing_corpus_fails_before_downloads(self):
         result = self.run_script('pipeline-benchmarks.sh', 1)
         self.assertIn('pipeline-mine-training-data.sh', result.stderr)
@@ -177,19 +216,19 @@ time.sleep(30)
         self.assertEqual(len(exports), 1)
         self.assertEqual(exports[0]['cwd'], str(self.mining / 'image'))
         for call in calls:
-            if 'benchmarkPackages:' in call['code'] or 'rerankerBenchmarksForSplit:' in call['code']:
+            if 'benchmarkPackages:' in call['code']:
                 self.assertEqual(call['cwd'], str(self.experiment / 'image'))
             self.assertNotIn('exportTrainingForSplit:', call['code'])
             self.assertNotIn('exportTestForSplit:', call['code'])
         self.assertTrue((self.root / 'benchmark-complete').exists())
         self.assertFalse((self.root / 'ollama-pid').exists(), 'Existing server must not be restarted')
         expected = {'results-table.tex', 'results-table-re-ranker.tex',
-                    'performance.png', 'performance-re-ranker.png', 'dataset-summary.tex'}
+                    'performance.png', 'performance-reranker.png', 'dataset-summary.tex'}
         self.assertEqual({p.name for p in (self.root / 'resutls').iterdir()}, expected)
         self.assertEqual((self.root / 'resutls/dataset-summary.tex').read_text(),
                          'Packages: 1 Classes: 2 Methods: 3')
-        self.assertEqual(sum('normalBenchmarksForSplit:' in c['code'] for c in calls), 2)
-        self.assertEqual(sum('rerankerBenchmarksForSplit:' in c['code'] for c in calls), 2)
+        self.assertEqual(sum('coo-package-result-v1' in c['code'] for c in calls), 4)
+        self.assertEqual(sum('CooPipelineStatistics' in c['code'] for c in calls), 2)
 
     def test_owned_ollama_stopped_after_run(self):
         self.run_script('pipeline-mine-training-data.sh')
@@ -199,11 +238,21 @@ time.sleep(30)
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+    def test_success_replaces_legacy_figure_filename(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        results = self.root / 'resutls'
+        results.mkdir()
+        legacy = results / 'performance-re-ranker.png'
+        legacy.write_bytes(b'old figure')
+        self.run_script('pipeline-benchmarks.sh')
+        self.assertFalse(legacy.exists())
+        self.assertTrue((results / 'performance-reranker.png').is_file())
+
     def test_failed_run_does_not_publish_partial_or_stale_outputs(self):
         self.run_script('pipeline-mine-training-data.sh')
         self.run_script('pipeline-benchmarks.sh')
         saved = {p.name: p.read_bytes() for p in (self.root / 'resutls').iterdir()}
-        for flag, status in [('TEST_FAIL_RERANKER', 24), ('TEST_MISSING_FIGURE', 1)]:
+        for flag, status in [('TEST_FAIL_RERANKER', 1), ('TEST_MISSING_FIGURE', 1)]:
             with self.subTest(flag=flag):
                 self.env[flag] = '1'
                 self.run_script('pipeline-benchmarks.sh', status)

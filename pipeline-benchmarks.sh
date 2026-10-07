@@ -8,6 +8,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! "${BENCHMARK_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Set BENCHMARK_JOBS to the number of simultaneous package jobs you want (positive integer)." >&2
+    exit 1
+fi
+export BENCHMARK_JOBS
 export MINING_DIR="${MINING_DIR:-$SCRIPT_DIR/mining}"
 if [[ ! -f "$MINING_DIR/corpus/manifest.json" ]]; then
     echo "Saved dataset missing. Run MINING_DIR=\"$MINING_DIR\" $SCRIPT_DIR/pipeline-mine-training-data.sh first." >&2
@@ -33,12 +38,17 @@ export RANKING_EPOCHS="${RANKING_EPOCHS:-10}"
 RERANKER_PID=""
 OLLAMA_PID=""
 RESULTS_LOCKED=""
+WORKER_PID=""
 
 if ! mkdir "$EXPERIMENT_DIR/.running" 2>/dev/null; then
     echo "Experiment is already running: $EXPERIMENT_DIR (.running lock)" >&2
     exit 1
 fi
 pipeline_cleanup() {
+    if [[ -n "$WORKER_PID" ]]; then
+        kill "$WORKER_PID" 2>/dev/null || true
+        wait "$WORKER_PID" 2>/dev/null || true
+    fi
     if [[ -n "$RERANKER_PID" ]]; then
         kill "$RERANKER_PID" 2>/dev/null || true
         wait "$RERANKER_PID" 2>/dev/null || true
@@ -135,17 +145,35 @@ Stdio stdout
     nextPutAll: file fullName; lf.
 "
 
-# Each training run gets fresh artifacts, but always reuses the experiment split.
-export RERANKER_RUN_DIR="$(mktemp -d "$EXPERIMENT_DIR/reranker-run.XXXXXX")"
+# New invocations train once. Explicit resumes retain the same model and results.
+if [[ -n "${BENCHMARK_RESUME_DIR:-}" ]]; then
+    RERANKER_RUN_DIR="$(cd "$BENCHMARK_RESUME_DIR" && pwd -P)"
+    if [[ "$(dirname "$RERANKER_RUN_DIR")" != "$EXPERIMENT_DIR" ||
+          ! -f "$RERANKER_RUN_DIR/training-ready" || ! -f "$RERANKER_RUN_DIR/workers.json" ]]; then
+        echo "BENCHMARK_RESUME_DIR must be a prepared package run inside EXPERIMENT_DIR." >&2
+        exit 1
+    fi
+    if ! cmp -s "$BENCHMARK_SPLIT_FILE" "$RERANKER_RUN_DIR/split.json" ||
+            [[ "$(cat "$RERANKER_RUN_DIR/training-ready")" != "$RANKING_EPOCHS" ]]; then
+        echo "Resume split or training epochs differ; restore the original settings or start a new run." >&2
+        exit 1
+    fi
+else
+    RERANKER_RUN_DIR="$(mktemp -d "$EXPERIMENT_DIR/reranker-run.XXXXXX")"
+    cp "$BENCHMARK_SPLIT_FILE" "$RERANKER_RUN_DIR/split.json"
+fi
+export RERANKER_RUN_DIR
 RERANKER_MODEL_DIR="$RERANKER_RUN_DIR/model"
-cp "$BENCHMARK_SPLIT_FILE" "$RERANKER_RUN_DIR/split.json"
-export PUBLICATION_DIR="$RERANKER_RUN_DIR/publication"
-mkdir -p "$PUBLICATION_DIR"
+export PUBLICATION_DIR="$(mktemp -d "$RERANKER_RUN_DIR/publication.XXXXXX")"
+echo "Run directory: $RERANKER_RUN_DIR"
+echo "Package concurrency selected by you: $BENCHMARK_JOBS"
 
-echo "Preparing training/test files from the saved corpus (benchmark packages excluded from training)"
-"${RERANKER_PYTHON:-python3}" "$SCRIPT_DIR/scripts/ranking_corpus.py" partition \
-    "$RANKING_CORPUS_DIR" --repository "$REPO_DIR" \
-    --split "$RERANKER_RUN_DIR/split.json" --output "$RERANKER_RUN_DIR"
+if [[ -z "${BENCHMARK_RESUME_DIR:-}" ]]; then
+    echo "Preparing training/test files from the saved corpus (benchmark packages excluded from training)"
+    "${RERANKER_PYTHON:-python3}" "$SCRIPT_DIR/scripts/ranking_corpus.py" partition \
+        "$RANKING_CORPUS_DIR" --repository "$REPO_DIR" \
+        --split "$RERANKER_RUN_DIR/split.json" --output "$RERANKER_RUN_DIR"
+fi
 
 if [[ -z "${RERANKER_PYTHON:-}" ]]; then
     python3 -m venv "$EXPERIMENT_DIR/reranker-venv"
@@ -153,17 +181,39 @@ if [[ -z "${RERANKER_PYTHON:-}" ]]; then
 fi
 "$RERANKER_PYTHON" -m pip install -r "$REPO_DIR/reranker/requirements.txt"
 
-echo "Training re-ranker (fixed epochs; no benchmark data)"
-TRAINING_SEED="$("$RERANKER_PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["seed"])' "$BENCHMARK_SPLIT_FILE")"
-"$RERANKER_PYTHON" "$REPO_DIR/reranker/train.py" \
-    "$RERANKER_RUN_DIR/training.jsonl" "$RERANKER_MODEL_DIR" \
-    --package-split "$RERANKER_RUN_DIR/split.json" \
-    --epochs "$RANKING_EPOCHS" --width 32 --seed "$TRAINING_SEED"
+if [[ -z "${BENCHMARK_RESUME_DIR:-}" ]]; then
+    echo "Training re-ranker (fixed epochs; no benchmark data)"
+    TRAINING_SEED="$("$RERANKER_PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["seed"])' "$BENCHMARK_SPLIT_FILE")"
+    "$RERANKER_PYTHON" "$REPO_DIR/reranker/train.py" \
+        "$RERANKER_RUN_DIR/training.jsonl" "$RERANKER_MODEL_DIR" \
+        --package-split "$RERANKER_RUN_DIR/split.json" \
+        --epochs "$RANKING_EPOCHS" --width 32 --seed "$TRAINING_SEED"
 
-# The trainer only receives training.jsonl. Evaluate the held-out file after training.
-echo "Evaluating the saved benchmark packages"
-"$RERANKER_PYTHON" "$REPO_DIR/reranker/evaluate.py" \
-    "$RERANKER_MODEL_DIR" "$RERANKER_RUN_DIR/test.jsonl" > "$RERANKER_RUN_DIR/evaluation.json"
+    # The trainer only receives training.jsonl. Evaluate the held-out file after training.
+    echo "Evaluating the saved benchmark packages"
+    "$RERANKER_PYTHON" "$REPO_DIR/reranker/evaluate.py" \
+        "$RERANKER_MODEL_DIR" "$RERANKER_RUN_DIR/test.jsonl" > "$RERANKER_RUN_DIR/evaluation.json"
+    printf '%s\n' "$RANKING_EPOCHS" > "$RERANKER_RUN_DIR/training-ready"
+else
+    echo "Reusing trained model and completed package checkpoints: $RERANKER_RUN_DIR"
+fi
+
+"$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" prepare \
+    --run "$RERANKER_RUN_DIR" --image "$EXPERIMENT_DIR/image"
+
+run_package_phase() {
+    "$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" run \
+        --run "$RERANKER_RUN_DIR" --image "$EXPERIMENT_DIR/image" \
+        --phase "$1" --jobs "$BENCHMARK_JOBS" &
+    WORKER_PID=$!
+    local status=0
+    wait "$WORKER_PID" || status=$?
+    WORKER_PID=""
+    if [[ "$status" != 0 ]]; then
+        echo "Package phase failed. Resume with BENCHMARK_RESUME_DIR=\"$RERANKER_RUN_DIR\" and your BENCHMARK_JOBS setting." >&2
+        return "$status"
+    fi
+}
 
 # The Pharo client uses localhost:11434. Reuse an existing healthy server, or
 # start a local one that this pipeline owns and cleans up on success or failure.
@@ -232,16 +282,7 @@ fi
     "$EXPERIMENT_DIR/llm-models.json" "$RERANKER_RUN_DIR/ollama-tags.json"
 
 echo "Running baseline, dependency, LLM completion and hybrid benchmarks on the saved packages"
-./pharo --headless Pharo.image eval "
-| directory split comparison files |
-directory := (OSEnvironment current at: 'RERANKER_RUN_DIR') asFileReference.
-split := CooBenchmarkSplit readFrom: directory / 'split.json'.
-comparison := CooBenchRunner normalBenchmarksForSplit: split.
-files := CooBenchRunner export: comparison to: (OSEnvironment current at: 'PUBLICATION_DIR').
-(directory / 'benchmark-corpus.json') writeStreamDo: [ :out |
-    out nextPutAll: (STONJSON toString: (comparison at: #corpus)); lf ].
-files do: [ :file | Stdio stdout nextPutAll: file fullName; lf ].
-"
+run_package_phase normal
 
 # Release an owned Ollama server before measuring the re-rankers.
 if [[ -n "$OLLAMA_PID" ]]; then
@@ -301,23 +342,19 @@ if ! kill -0 "$RERANKER_PID" 2>/dev/null; then
 fi
 
 echo "Running re-ranking benchmarks on the saved benchmark packages"
-./pharo --headless Pharo.image eval "
-| directory split comparison file expectedCorpus |
-directory := (OSEnvironment current at: 'RERANKER_RUN_DIR') asFileReference.
-split := CooBenchmarkSplit readFrom: directory / 'split.json'.
-comparison := CooBenchRunner rerankerBenchmarksForSplit: split.
-expectedCorpus := STONJSON fromString: (directory / 'benchmark-corpus.json') contents.
-#(packages classes methods) do: [ :key |
-    ((comparison at: #corpus) at: key) = (expectedCorpus at: key asString)
-        ifFalse: [ Error signal: 'Normal and re-ranker benchmark corpus counts differ' ] ].
-file := CooBenchRunner exportReranker: comparison to: (OSEnvironment current at: 'PUBLICATION_DIR').
-Stdio stdout nextPutAll: file fullName; lf.
-Stdio stdout nextPutAll: (file parent / 'performance-re-ranker.png') fullName; lf.
-"
+run_package_phase reranker
+
+echo "Aggregating all packages and exporting the five publication files"
+export BENCHMARK_AGGREGATE="$RERANKER_RUN_DIR/aggregate.json"
+"$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" aggregate \
+    --run "$RERANKER_RUN_DIR" --image "$EXPERIMENT_DIR/image"
+./pharo --headless Pharo.image --no-default-preferences eval "$(cat "$SCRIPT_DIR/scripts/benchmark-export.st")"
+# The upstream exporter uses an extra hyphen; publish the requested filename.
+mv "$PUBLICATION_DIR/performance-re-ranker.png" "$PUBLICATION_DIR/performance-reranker.png"
 
 # Publish only a complete set from this run, so a failure cannot combine old and
 # new benchmark artifacts. Training files, logs and metadata stay in the run dir.
-publication_files=(results-table.tex results-table-re-ranker.tex performance.png performance-re-ranker.png dataset-summary.tex)
+publication_files=(results-table.tex results-table-re-ranker.tex performance.png performance-reranker.png dataset-summary.tex)
 for name in "${publication_files[@]}"; do
     if [[ ! -s "$PUBLICATION_DIR/$name" ]]; then
         echo "Missing or empty benchmark artifact: $PUBLICATION_DIR/$name" >&2
@@ -327,5 +364,7 @@ done
 for name in "${publication_files[@]}"; do
     cp "$PUBLICATION_DIR/$name" "$RESULTS_DIR/$name"
 done
+# Retire the former filename only after the complete new set was published.
+rm -f -- "$RESULTS_DIR/performance-re-ranker.png"
 echo "All benchmarks complete. Tables, figures and shared dataset summary: $RESULTS_DIR"
 echo "Model, separate training/test corpora, split, evaluation and log: $RERANKER_RUN_DIR"
