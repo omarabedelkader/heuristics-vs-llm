@@ -28,7 +28,7 @@ esac
 # Both pipelines share this image, package split and results directory.
 export EXPERIMENT_DIR="$RUN_DIR"
 export RESULTS_DIR="$RUN_DIR/results"
-export BENCHMARK_PACKAGE_COUNT="${BENCHMARK_PACKAGE_COUNT:-50}"
+export BENCHMARK_PACKAGE_COUNT="${BENCHMARK_PACKAGE_COUNT:-5}"
 export RANKING_SEED="${RANKING_SEED:-42}"
 export RANKING_EPOCHS="${RANKING_EPOCHS:-10}"
 export BENCHMARK_REF="${BENCHMARK_REF:-main}"
