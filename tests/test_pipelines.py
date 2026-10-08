@@ -276,7 +276,7 @@ time.sleep(30)
         calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
         self.assertEqual(sum('exportRankingCorpusForPackages:' in c['code'] for c in calls), 1)
         self.assertEqual((self.root / 'downloads').read_text().splitlines(),
-                         [str(self.mining / 'image'), str(self.experiment / 'image')])
+                         [str(self.mining / 'image')])
 
     def test_failed_automatic_mining_stops_before_benchmarks(self):
         self.env['TEST_FAIL_MINING'] = '1'
@@ -307,22 +307,32 @@ time.sleep(30)
         self.assertEqual(path.read_text(), 'corrupted data\n')
         self.assertEqual((self.root / 'pharo-calls.jsonl').read_bytes(), calls)
 
-    def test_two_downloads_and_saved_data_survives_removing_mining_image(self):
+    def test_exact_image_copy_and_existing_experiment_survives_removing_mining_image(self):
         self.run_script('pipeline-mine-training-data.sh')
         self.assertFalse((self.mining / 'split.json').exists())
         mining_image = (self.mining / 'image/Pharo.image').read_bytes()
+        (self.mining / 'image/Pharo.changes').write_text('mining changes')
+        (self.mining / 'image/Pharo.sources').write_text('matching sources')
+        (self.mining / 'image/pharo-vm').mkdir()
+        (self.mining / 'image/pharo-vm/runtime').write_text('matching VM')
+        self.run_script('pipeline-benchmarks.sh')
+        self.assertEqual((self.experiment / 'image/Pharo.image').read_bytes(), mining_image)
+        self.assertFalse(os.path.samefile(self.mining / 'image/Pharo.image',
+                                         self.experiment / 'image/Pharo.image'))
+        for name in ('Pharo.changes', 'Pharo.sources', 'pharo-vm/runtime'):
+            self.assertEqual((self.experiment / 'image' / name).read_bytes(),
+                             (self.mining / 'image' / name).read_bytes())
         calls_before = (self.root / 'pharo-calls.jsonl').read_bytes()
         shutil.rmtree(self.mining / 'image')
         self.run_script('pipeline-mine-training-data.sh')
         self.assertEqual((self.root / 'pharo-calls.jsonl').read_bytes(), calls_before)
-        self.run_script('pipeline-benchmarks.sh')
-        self.assertNotEqual((self.experiment / 'image/Pharo.image').read_bytes(), mining_image)
         split = (self.experiment / 'split.json').read_bytes()
         self.run_script('pipeline-benchmarks.sh')
         self.assertEqual((self.experiment / 'split.json').read_bytes(), split)
         self.assertEqual((self.root / 'downloads').read_text().splitlines(),
-                         [str(self.mining / 'image'), str(self.experiment / 'image')])
+                         [str(self.mining / 'image')])
         calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
+        self.assertEqual(sum('Metacello new' in c['code'] for c in calls), 1)
         exports = [c for c in calls if 'exportRankingCorpusForPackages:' in c['code']]
         self.assertEqual(len(exports), 1)
         self.assertEqual(exports[0]['cwd'], str(self.mining / 'image'))
@@ -340,6 +350,30 @@ time.sleep(30)
                          'Packages: 1 Classes: 2 Methods: 3')
         self.assertEqual(sum('coo-package-result-v1' in c['code'] for c in calls), 4)
         self.assertEqual(sum('CooPipelineStatistics' in c['code'] for c in calls), 2)
+
+    def test_new_experiment_requires_original_mining_image(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        shutil.rmtree(self.mining / 'image')
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn('original mining image is required', result.stderr)
+        self.assertEqual(len((self.root / 'downloads').read_text().splitlines()), 1)
+        self.assertFalse((self.experiment / 'image').exists())
+
+    def test_changed_mining_image_rejected_before_selection(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        (self.mining / 'image/Pharo.image').write_bytes(b'different Pharo build')
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn('Image does not match the prepared corpus', result.stderr)
+        self.assertFalse((self.experiment / 'image').exists())
+        self.assertFalse((self.experiment / 'benchmark-selection.json').exists())
+
+    def test_changed_benchmark_image_rejected_on_rerun(self):
+        self.run_script('pipeline-benchmarks.sh')
+        (self.experiment / 'image/Pharo.image').write_bytes(b'different Pharo build')
+        calls = (self.root / 'pharo-calls.jsonl').read_bytes()
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn('Image does not match the prepared corpus', result.stderr)
+        self.assertEqual((self.root / 'pharo-calls.jsonl').read_bytes(), calls)
 
     def test_owned_ollama_stopped_after_run(self):
         self.run_script('pipeline-mine-training-data.sh')

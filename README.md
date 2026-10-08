@@ -23,8 +23,9 @@ reusing its normal benchmark results and trained model. Use `--help` for usage.
 The pipeline first checks for `mining/corpus/manifest.json`. If a completed dataset
 exists, it verifies and reuses it. Otherwise, it automatically runs
 `pipeline-mine-training-data.sh` and continues only after mining succeeds.
-Mining and benchmarking use **separate Pharo images**; benchmark workers never
-run or copy the mining image. You can still run the mining script separately.
+Mining and benchmarking use **separate copies of the same Pharo image snapshot**.
+The benchmark template copies the mining image, VM and supporting files without
+downloading a newer build or reinstalling code. You can still run mining separately.
 
 An existing mining lock prevents starting a second mining process. If mining is
 already running, the pipeline stops with that explanation; rerun it after mining
@@ -48,9 +49,9 @@ verifies and reuses a completed dataset. Publication happens only after a comple
 export succeeds; interrupted attempts remain under `corpus-pending.*` and are not
 used. Mining needs Python 3, curl and tar; it does not need Ollama or ML dependencies.
 
-Once mining succeeds, keep `corpus/` and `repository/`. **The mining image is no
-longer needed to train or benchmark.** These two directories can also be transferred
-to another machine under its `MINING_DIR`.
+Once mining succeeds, keep `corpus/`, `repository/` and **`image/`**. Each new
+experiment needs the original mining snapshot. Transfer all three directories
+under `MINING_DIR` when moving to a machine with a compatible OS and architecture.
 
 ## 2. Complete comparison pipeline
 
@@ -58,7 +59,8 @@ to another machine under its `MINING_DIR`.
 
 1. Checks for the saved corpus, runs mining if missing, then verifies the corpus
    and copies its frozen source snapshot.
-2. Downloads its own Pharo image into `experiment/image/` and installs that source.
+2. Copies `mining/image/` into `experiment/image/` and verifies the image checksum
+   against the corpus manifest. The installed source is already in that snapshot.
 3. Randomly selects and reserves the benchmark packages. Saves the selection in
    `experiment/benchmark-selection.json` and the authoritative four-part package
    split in `experiment/split.json`.
@@ -136,12 +138,12 @@ fail if they disagree with the saved split. Each new training run gets a new
 `experiment/reranker-run.*/` directory containing its model, split, filtered
 training/validation/test files, corpus provenance, evaluation, figures and logs.
 
-The independently downloaded image must have the same eligible package names as
-the dataset, and use the same frozen benchmark source. A mismatch fails before
-training; it never silently drops packages or re-mines data. Both scripts default
-to the Pharo 14 downloader. If the upstream image changes between downloads, use
-`PHARO_DOWNLOAD_URL` for a compatible/pinned Pharo image installer, or prepare a
-new dataset for that image. The image files themselves do not need identical hashes.
+The benchmark template must match the mining-image checksum recorded in the corpus
+manifest, including on reruns. Workers receive their own writable copies of that
+template. A mismatch fails before selection or training; packages are never silently
+dropped and data is never re-mined. Existing experiments from the former download
+workflow need a new `EXPERIMENT_DIR` using the original mining snapshot.
+`PHARO_DOWNLOAD_URL` only controls the initial mining-image download.
 
 The single final output folder is **`resutls/` beside the scripts** (using the
 requested spelling):
@@ -306,7 +308,7 @@ bash -n pipeline-mine-training-data.sh pipeline-benchmarks.sh
 ```
 
 The shell integration tests use stand-ins for downloads, Pharo and ML execution.
-They verify separate image downloads, saved-data reuse without the mining image,
+They verify exact image copying, rejection of changed snapshots, saved-data reuse,
 package exclusion, saved-split reuse across both comparisons, all five final
 artifacts, failure handling, server cleanup, and rejection of incompatible source
 or package pools. API tests check model reuse, downloads, and download failures.

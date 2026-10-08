@@ -89,4 +89,4 @@ CooBenchRunner exportRankingCorpusForPackages: packages to: directory / 'all.jso
     "$CORPUS_STAGE_DIR" --image "$MINING_DIR/image/Pharo.image" --repository "$REPO_DIR"
 mv "$CORPUS_STAGE_DIR" "$RANKING_CORPUS_DIR"
 echo "Prepared corpus: $RANKING_CORPUS_DIR"
-echo "Run pipeline-benchmarks.sh with the same MINING_DIR; it downloads a separate benchmark image."
+echo "Keep the mining image. Run pipeline-benchmarks.sh with the same MINING_DIR; it copies that image for benchmarks."

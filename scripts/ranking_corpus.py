@@ -169,7 +169,7 @@ def load_manifest(corpus, image=None, repository=None):
             or not sum(counts.values()) or sum(counts.values()) != manifest.get("rows")):
         raise ValueError("Invalid corpus package counts")
     if image is not None and manifest.get("imageSHA256") != sha256(image):
-        raise ValueError("Prepared corpus belongs to a different image; use the original experiment")
+        raise ValueError("Image does not match the prepared corpus; restore the original mining image snapshot or use a new EXPERIMENT_DIR with that snapshot")
     if repository is not None and manifest.get("repositorySHA256") != repository_sha256(repository):
         raise ValueError("Frozen source does not match the corpus; restore its repository or mine a new dataset")
     return manifest, eligible

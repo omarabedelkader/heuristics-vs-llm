@@ -96,7 +96,7 @@ if [[ ! -f "$RANKING_CORPUS_DIR/manifest.json" ]]; then
 else
     echo "Using saved dataset: $RANKING_CORPUS_DIR"
 fi
-# Verify before benchmark downloads. Invalid saved data is never silently replaced.
+# Verify before copying the benchmark image. Invalid saved data is never silently replaced.
 "${RERANKER_PYTHON:-python3}" "$SCRIPT_DIR/scripts/ranking_corpus.py" verify \
     "$RANKING_CORPUS_DIR" --repository "$MINING_DIR/repository"
 if [[ ! -d "$REPO_DIR" ]]; then
@@ -117,28 +117,42 @@ from ranking_corpus import load_manifest
 load_manifest(Path(sys.argv[2]), repository=Path(sys.argv[3]))
 PYCODE
 
-mkdir -p "$EXPERIMENT_DIR/image"
-cd "$EXPERIMENT_DIR/image"
-if [[ ! -f Pharo.image || ! -x pharo ]]; then
+if [[ ! -e "$EXPERIMENT_DIR/image" ]]; then
     if [[ -f "$BENCHMARK_SPLIT_FILE" || -f "$EXPERIMENT_DIR/image-ready" ]]; then
         echo "The experiment image is missing; restore it or use a new EXPERIMENT_DIR." >&2
         exit 1
     fi
-    echo "Downloading separate benchmark Pharo image"
-    curl -fsSL "${PHARO_DOWNLOAD_URL:-https://get.pharo.org/140+vm}" -o get-pharo.sh
-    bash get-pharo.sh
+    if [[ ! -f "$MINING_DIR/image/Pharo.image" || ! -x "$MINING_DIR/image/pharo" ]]; then
+        echo "The original mining image is required; restore MINING_DIR/image from the dataset's snapshot." >&2
+        exit 1
+    fi
+    echo "Copying the original mining image for benchmarks"
+    image_stage="$(mktemp -d "$EXPERIMENT_DIR/image.XXXXXX")"
+    cp -R "$MINING_DIR/image/." "$image_stage/"
+    # Verify the copied bytes before publishing the template; never reinstall code.
+    "${RERANKER_PYTHON:-python3}" - "$SCRIPT_DIR/scripts" "$RANKING_CORPUS_DIR" "$image_stage/Pharo.image" <<'PYCODE'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from ranking_corpus import load_manifest
+load_manifest(Path(sys.argv[2]), image=Path(sys.argv[3]))
+PYCODE
+    mv "$image_stage" "$EXPERIMENT_DIR/image"
 fi
-
-if [[ ! -f "$EXPERIMENT_DIR/image-ready" ]]; then
-    echo "Installing frozen benchmark source"
-    ./pharo --headless Pharo.image eval --save "
-Metacello new
-    repository: 'tonel://', ((OSEnvironment current at: 'REPO_DIR') asFileReference / 'src') fullName;
-    baseline: 'ExtendedHeuristicCompletionBenchmarks';
-    load
-"
-    touch "$EXPERIMENT_DIR/image-ready"
+if [[ ! -f "$EXPERIMENT_DIR/image/Pharo.image" || ! -x "$EXPERIMENT_DIR/image/pharo" ]]; then
+    echo "The experiment image is incomplete; restore it or use a new EXPERIMENT_DIR." >&2
+    exit 1
 fi
+# Check on reruns too, rejecting older experiments that downloaded a different image.
+"${RERANKER_PYTHON:-python3}" - "$SCRIPT_DIR/scripts" "$RANKING_CORPUS_DIR" "$EXPERIMENT_DIR/image/Pharo.image" <<'PYCODE'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from ranking_corpus import load_manifest
+load_manifest(Path(sys.argv[2]), image=Path(sys.argv[3]))
+PYCODE
+touch "$EXPERIMENT_DIR/image-ready"
+cd "$EXPERIMENT_DIR/image"
 
 # Select and save benchmark names in the independent benchmark image.
 ./pharo --headless Pharo.image eval "

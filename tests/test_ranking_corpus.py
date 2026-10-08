@@ -115,7 +115,7 @@ class CorpusTests(unittest.TestCase):
     def test_wrong_image_rejected(self):
         self.finalize()
         self.image.write_bytes(b"other image")
-        with self.assertRaisesRegex(ValueError, "different image"):
+        with self.assertRaisesRegex(ValueError, "Image does not match the prepared corpus"):
             self.partition()
 
     def test_truncated_corpus_never_publishes_training_data(self):
