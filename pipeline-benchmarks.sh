@@ -88,11 +88,20 @@ if ! mkdir "$RESULTS_DIR/.running" 2>/dev/null; then
 fi
 RESULTS_LOCKED=1
 
-# Mine only when no completed dataset exists. The mining script owns its lock,
-# image and staging directory; it refuses to overlap an existing mining process.
+# Prefer the pinned dataset snapshot. Only an absent remote snapshot permits mining;
+# download/integrity failures must not silently produce different experimental inputs.
 if [[ ! -f "$RANKING_CORPUS_DIR/manifest.json" ]]; then
-    echo "No completed dataset found. Running pipeline-mine-training-data.sh"
-    bash "$SCRIPT_DIR/pipeline-mine-training-data.sh"
+    echo "No completed local dataset found. Checking the Hugging Face snapshot"
+    if "${RERANKER_PYTHON:-python3}" "$SCRIPT_DIR/scripts/download_snapshot.py" "$MINING_DIR"; then
+        echo "Using downloaded dataset: $RANKING_CORPUS_DIR"
+    else
+        snapshot_status=$?
+        if [[ "$snapshot_status" != 3 ]]; then
+            exit "$snapshot_status"
+        fi
+        echo "No remote snapshot found. Running pipeline-mine-training-data.sh"
+        bash "$SCRIPT_DIR/pipeline-mine-training-data.sh"
+    fi
 else
     echo "Using saved dataset: $RANKING_CORPUS_DIR"
 fi
@@ -153,6 +162,17 @@ load_manifest(Path(sys.argv[2]), image=Path(sys.argv[3]))
 PYCODE
 touch "$EXPERIMENT_DIR/image-ready"
 cd "$EXPERIMENT_DIR/image"
+
+# A fresh default experiment reuses the published selection. Explicit package/seed
+# settings request a new selection through the existing Pharo selection workflow.
+if [[ ! -e "$BENCHMARK_SELECTION_FILE" && ! -e "$BENCHMARK_SPLIT_FILE" &&
+      -f "$MINING_DIR/snapshot-selection/split.json" &&
+      -z "$BENCHMARK_PACKAGE_COUNT" && -z "$RANKING_SEED" &&
+      "$RANKING_SPLIT_RATIOS" == "80,10,10" ]]; then
+    cp "$MINING_DIR/snapshot-selection/benchmark-selection.json" "$BENCHMARK_SELECTION_FILE"
+    cp "$MINING_DIR/snapshot-selection/split.json" "$BENCHMARK_SPLIT_FILE"
+    echo "Using the snapshot's saved benchmark selection and train/validation/test split"
+fi
 
 # Select and save benchmark names in the independent benchmark image.
 ./pharo --headless Pharo.image eval "

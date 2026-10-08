@@ -21,8 +21,37 @@ You can later resume that same run without the flag to add the neural benchmarks
 reusing its normal benchmark results and trained model. Use `--help` for usage.
 
 The pipeline first checks for `mining/corpus/manifest.json`. If a completed dataset
-exists, it verifies and reuses it. Otherwise, it automatically runs
+exists, it verifies and reuses it without accessing Hugging Face. Otherwise, it
+downloads the published [dataset snapshot](https://huggingface.co/datasets/pharo-llm/pharo-reranker-dataset/tree/904b689aed068d765a0fac4bd664e8e60773cd4c),
+pinned to commit `904b689aed068d765a0fac4bd664e8e60773cd4c`. If no snapshot is
+published at that revision (the checksum list returns HTTP 404), it runs
 `pipeline-mine-training-data.sh` and continues only after mining succeeds.
+Network, permission, checksum and incomplete-snapshot errors stop the pipeline;
+they never silently trigger mining.
+
+The download uses Python's standard library and curl; no Hugging Face login or
+Python package is needed for this public dataset. About 1.04 GB is transferred.
+The compressed corpus and ZIPs are verified, extracted into a temporary directory,
+and checked against the original image, source and corpus fingerprints before
+publication. The completed corpus is installed last. Archive launch permissions
+are preserved. The current pipeline scripts are never replaced by archived code.
+Download preparation uses the same mining lock as the mining script.
+
+The published VM is **macOS ARM64**. The downloader rejects an incompatible host
+before downloading the large payloads. On Linux/OAR, use a snapshot containing a
+compatible VM via the variables below, or explicitly run the mining script locally
+first. Local mining creates a new corpus and is not a reproduction of this snapshot.
+Allow at least 32 GB free for restoration and training partitions, plus space for
+models and package workers. Interrupted/failed downloads clean up their staging
+files; existing mining files are never overwritten by a download.
+
+A fresh experiment downloaded with no explicit `BENCHMARK_PACKAGE_COUNT` or
+`RANKING_SEED` and the default ratios reuses the snapshot's saved split: **5 benchmark,
+581 training, 73 validation and 73 test packages, seed 42**. Explicit count/seed or
+nondefault ratio settings create a new selection using the existing workflow.
+Downloaded split files remain in `mining/snapshot-selection/`, with the dataset
+commit recorded in `mining/snapshot-origin.json`. Existing experiment selections
+are always retained.
 Mining and benchmarking use **separate copies of the same Pharo image snapshot**.
 The benchmark template copies the mining image, VM and supporting files without
 downloading a newer build or reinstalling code. You can still run mining separately.
@@ -57,7 +86,8 @@ under `MINING_DIR` when moving to a machine with a compatible OS and architectur
 
 `pipeline-benchmarks.sh` performs the whole comparison workflow:
 
-1. Checks for the saved corpus, runs mining if missing, then verifies the corpus
+1. Checks for the saved corpus, downloads the pinned snapshot if missing (or mines
+   if no remote snapshot is published), then verifies the corpus
    and copies its frozen source snapshot.
 2. Copies `mining/image/` into `experiment/image/` and verifies the image checksum
    against the corpus manifest. The installed source is already in that snapshot.
@@ -132,7 +162,8 @@ CPU/GPU/RAM capacity determine the speedup; 8 jobs does not guarantee an 8× spe
 Timing measurements include contention at the selected concurrency. Each phase
 records the chosen job count in `worker-invocations.jsonl`, including on resume.
 
-The first run defaults to 50 randomly selected packages and seed 42. Later runs
+The first run uses the downloaded snapshot's saved selection when available;
+otherwise it defaults to 50 randomly selected packages and seed 42. Later runs
 reuse the saved selection and benchmark image. Explicit count, seed or ratio changes
 fail if they disagree with the saved split. Each new training run gets a new
 `experiment/reranker-run.*/` directory containing its model, split, filtered
@@ -277,8 +308,10 @@ mixing their output files. A successful later run replaces the five published fi
 | Variable | Default / purpose |
 | --- | --- |
 | `MINING_DIR` | `mining/` beside the scripts; saved dataset, source and mining image |
+| `RANKING_DATASET_REPO` | `pharo-llm/pharo-reranker-dataset`; public Hugging Face dataset checked when local corpus is missing |
+| `RANKING_DATASET_REVISION` | `904b689aed068d765a0fac4bd664e8e60773cd4c`; full immutable commit SHA, never a moving branch |
 | `EXPERIMENT_DIR` | `experiment/` beside the scripts; independent benchmark image and split |
-| `BENCHMARK_PACKAGE_COUNT` | 50 on the first benchmark run; saved count thereafter |
+| `BENCHMARK_PACKAGE_COUNT` | Snapshot's saved count (5) after download unless explicitly set; otherwise 50 for a new selection; saved count thereafter |
 | `BENCHMARK_JOBS` | Required positive integer chosen by you; maximum simultaneous package processes |
 | `BENCHMARK_RESUME_DIR` | Optional existing `reranker-run.*` directory; reuse its trained model and completed package phases |
 | `RANKING_SEED` | 42 on the first benchmark run; saved seed thereafter |
@@ -287,7 +320,7 @@ mixing their output files. A successful later run replaces the five published fi
 | `RESULTS_DIR` | `resutls/` beside the scripts; one folder for all five publication files |
 | `BENCHMARK_REPO_DIR` | Mining source checkout; defaults to the sibling `HeuristicCompletion-Benchmarks-Multiples` checkout |
 | `BENCHMARK_REF` | `main`, when mining fetches source from GitHub instead |
-| `PHARO_DOWNLOAD_URL` | `https://get.pharo.org/140+vm`; installer used independently by each script |
+| `PHARO_DOWNLOAD_URL` | `https://get.pharo.org/140+vm`; installer used only when mining locally |
 | `RERANKER_PYTHON` | Optional Python environment; otherwise training creates an experiment venv |
 | `OLLAMA_BIN` | Optional Ollama executable; otherwise use PATH or a local Linux installation |
 | `OLLAMA_MODELS_DIR` | `.ollama-models/` beside the scripts, for servers started by this pipeline |
