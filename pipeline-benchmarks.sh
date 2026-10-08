@@ -88,22 +88,28 @@ if ! mkdir "$RESULTS_DIR/.running" 2>/dev/null; then
 fi
 RESULTS_LOCKED=1
 
-# Prefer the pinned dataset snapshot. Only an absent remote snapshot permits mining;
-# download/integrity failures must not silently produce different experimental inputs.
+# Dataset source, in order: local corpus, then the pinned Hugging Face snapshot,
+# then mining. Mining runs only when the snapshot is absent (exit 3) or unusable
+# (exit 4); local problems that mining cannot fix (exit 1) stop the pipeline.
 if [[ ! -f "$RANKING_CORPUS_DIR/manifest.json" ]]; then
-    echo "No completed local dataset found. Checking the Hugging Face snapshot"
-    if "${RERANKER_PYTHON:-python3}" "$SCRIPT_DIR/scripts/download_snapshot.py" "$MINING_DIR"; then
-        echo "Using downloaded dataset: $RANKING_CORPUS_DIR"
-    else
-        snapshot_status=$?
-        if [[ "$snapshot_status" != 3 ]]; then
-            exit "$snapshot_status"
-        fi
-        echo "No remote snapshot found. Running pipeline-mine-training-data.sh"
-        bash "$SCRIPT_DIR/pipeline-mine-training-data.sh"
-    fi
+    echo "No completed local dataset at $RANKING_CORPUS_DIR. Checking the Hugging Face snapshot"
+    snapshot_status=0
+    "${RERANKER_PYTHON:-python3}" "$SCRIPT_DIR/scripts/download_snapshot.py" "$MINING_DIR" || snapshot_status=$?
+    case "$snapshot_status" in
+        0) echo "Using downloaded dataset: $RANKING_CORPUS_DIR" ;;
+        3|4)
+            if [[ "$snapshot_status" == 3 ]]; then
+                echo "WARNING: dataset not found locally and no snapshot is published remotely." >&2
+            else
+                echo "WARNING: dataset not found locally and the remote snapshot is NOT usable (reason above)." >&2
+            fi
+            echo "WARNING: mining a new dataset with pipeline-mine-training-data.sh (this takes a long time)." >&2
+            bash "$SCRIPT_DIR/pipeline-mine-training-data.sh"
+            echo "Using mined dataset: $RANKING_CORPUS_DIR" ;;
+        *) exit "$snapshot_status" ;;
+    esac
 else
-    echo "Using saved dataset: $RANKING_CORPUS_DIR"
+    echo "Using saved local dataset: $RANKING_CORPUS_DIR"
 fi
 # Verify before copying the benchmark image. Invalid saved data is never silently replaced.
 "${RERANKER_PYTHON:-python3}" "$SCRIPT_DIR/scripts/ranking_corpus.py" verify \

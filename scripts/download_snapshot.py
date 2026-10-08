@@ -1,4 +1,9 @@
-"""Restore the pinned public Hugging Face snapshot; exit 3 only if it is absent."""
+"""Restore the pinned public Hugging Face snapshot.
+
+Exit 0: restored or already local; 3: no published snapshot; 4: a published
+snapshot exists but is unusable (download, checksum, content or VM problem);
+1: local problem that mining cannot fix (lock, partial local data, disk space).
+"""
 import argparse
 import gzip
 import json
@@ -28,6 +33,10 @@ CORPUS_FILES = ("mining/corpus/manifest.json", "mining/corpus/packages.json",
                 "mining/corpus/all.jsonl.gz")
 
 
+class LocalStateError(ValueError):
+    """A local condition that mining would not fix; never triggers a mining fallback."""
+
+
 def download(base, name, directory, optional=False):
     target = directory / name
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -41,7 +50,7 @@ def download(base, name, directory, optional=False):
         return None
     if result.returncode or status != "200":
         raise ValueError(f"Snapshot download failed for {name} (HTTP {status or 'unknown'}, "
-                         f"curl exit {result.returncode}); no mining fallback. Retry the download.")
+                         f"curl exit {result.returncode})")
     return target
 
 
@@ -74,16 +83,19 @@ def extract(archive, destination, members):
 
 def restore(mining, repo, revision):
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo) or not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise ValueError("RANKING_DATASET_REPO must be owner/name and RANKING_DATASET_REVISION a full commit SHA")
+        raise LocalStateError("RANKING_DATASET_REPO must be owner/name and RANKING_DATASET_REVISION a full commit SHA")
     mining.mkdir(parents=True, exist_ok=True)
     lock = mining / ".running"
     try:
         lock.mkdir()
     except FileExistsError:
-        raise ValueError(f"Mining is already running: {mining} (.running lock)") from None
+        raise LocalStateError(f"Mining is already running: {mining} (.running lock)") from None
     try:
         if (mining / "corpus/manifest.json").is_file():
-            verify(mining / "corpus", repository=mining / "repository")
+            try:
+                verify(mining / "corpus", repository=mining / "repository")
+            except ValueError as error:
+                raise LocalStateError(f"Local dataset is invalid: {error}") from None
             return 0
         base = f"https://huggingface.co/datasets/{repo}/resolve/{revision}"
         with tempfile.TemporaryDirectory(prefix=".snapshot-pending.", dir=mining) as temporary:
@@ -95,7 +107,7 @@ def restore(mining, repo, revision):
             # No snapshot may overwrite unfinished mining or a partial restore.
             for name in ("corpus", "image", "repository", "image-ready", "snapshot-selection", "snapshot-origin.json"):
                 if (mining / name).exists() or (mining / name).is_symlink():
-                    raise ValueError(f"Incomplete local mining state at {mining / name}; "
+                    raise LocalStateError(f"Incomplete local mining state at {mining / name}; "
                                      "restore it or use a new MINING_DIR. Nothing was overwritten.")
             checksums = {}
             for line in checksum_file.read_text().splitlines():
@@ -126,7 +138,7 @@ def restore(mining, repo, revision):
                 raise ValueError(f"Snapshot VM requires {runtime['os']} {runtime['architecture']}; "
                                  f"this host is {platform.system()} {platform.machine()}. "
                                  "Use a snapshot with a compatible VM, or prepare local mining data "
-                                 "with pipeline-mine-training-data.sh. No automatic re-mining was performed.")
+                                 "with pipeline-mine-training-data.sh.")
             required = {}
             for name, info in snapshot["archiveMembers"].items():
                 if (name.startswith(("mining/image/", "mining/repository/")) or
@@ -136,7 +148,7 @@ def restore(mining, repo, revision):
             needed = (storage["uncompressedBytes"] + storage["compressedBytes"] +
                       sum(info["size"] for info in required.values()))
             if shutil.disk_usage(mining).free < needed:
-                raise ValueError(f"Insufficient disk space to restore snapshot: need approximately "
+                raise LocalStateError(f"Insufficient disk space to restore snapshot: need approximately "
                                  f"{needed / 1e9:.1f} GB free, plus space for training and workers")
             unpacked = stage / "restored"
             for archive_name in (IMAGE_ARCHIVE, SOURCE_ARCHIVE):
@@ -194,9 +206,13 @@ def main():
         signal.signal(number, interrupted)
     try:
         return restore(args.mining, args.repo, args.revision)
-    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, EOFError) as error:
+    except LocalStateError as error:
         print(f"Snapshot error: {error}", file=sys.stderr)
         return 1
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, EOFError,
+            subprocess.CalledProcessError) as error:
+        print(f"Remote snapshot is not usable: {error}", file=sys.stderr)
+        return 4
 
 
 if __name__ == "__main__":

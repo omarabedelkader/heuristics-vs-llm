@@ -276,40 +276,55 @@ time.sleep(30)
         self.run_script('pipeline-benchmarks.sh')
         self.assertEqual((self.root / 'hf-requests').read_bytes(), requests)
 
-    def test_hub_outage_does_not_trigger_mining(self):
-        self.env['TEST_HF_STATUS'] = '503'
-        result = self.run_script('pipeline-benchmarks.sh', 1)
-        self.assertIn('no mining fallback', result.stderr)
-        self.assertFalse((self.root / 'downloads').exists())
-        self.assertFalse((self.mining / 'corpus').exists())
+    def assert_logged_and_mined(self, result, reason):
+        self.assertIn(reason, result.stderr)
+        self.assertIn('remote snapshot is NOT usable', result.stderr)
+        self.assertIn('mining a new dataset', result.stderr)
+        self.assertIn('exportRankingCorpusForPackages:', (self.root / 'pharo-calls.jsonl').read_text())
+        self.assertTrue((self.mining / 'corpus/manifest.json').exists())
+        self.assertFalse((self.mining / 'snapshot-origin.json').exists())
+        self.assertEqual(list(self.mining.glob('.snapshot-pending.*')), [])
+        self.assertTrue((self.root / 'benchmark-complete').exists())
 
-    def test_corrupt_download_is_not_published_or_remined(self):
+    def test_absent_local_and_remote_dataset_is_logged_then_mined(self):
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assertIn('no snapshot is published remotely', result.stderr)
+        self.assertIn('mining a new dataset', result.stderr)
+        self.assertIn('exportRankingCorpusForPackages:', (self.root / 'pharo-calls.jsonl').read_text())
+        self.assertTrue((self.root / 'benchmark-complete').exists())
+        # A completed local dataset is reused: no remote check and no second mining.
+        requests = (self.root / 'hf-requests').read_bytes()
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assertIn('Using saved local dataset', result.stdout)
+        self.assertEqual((self.root / 'hf-requests').read_bytes(), requests)
+        self.assertEqual((self.root / 'pharo-calls.jsonl').read_text().count('exportRankingCorpusForPackages:'), 1)
+
+    def test_hub_outage_is_logged_then_mined(self):
+        self.env['TEST_HF_STATUS'] = '503'
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assert_logged_and_mined(result, 'HTTP 503')
+
+    def test_corrupt_download_is_not_published_and_is_mined(self):
         fixture = self.prepare_hub_snapshot()
         (fixture / 'mining/corpus/all.jsonl.gz').write_bytes(b'corrupted')
-        result = self.run_script('pipeline-benchmarks.sh', 1)
-        self.assertIn('checksum mismatch', result.stderr)
-        self.assertFalse((self.mining / 'corpus').exists())
-        self.assertFalse((self.mining / 'image').exists())
-        self.assertFalse((self.root / 'downloads').exists())
-        self.assertEqual(list(self.mining.glob('.snapshot-pending.*')), [])
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assert_logged_and_mined(result, 'checksum mismatch')
 
-    def test_incomplete_remote_snapshot_is_an_error_not_mining_fallback(self):
+    def test_incomplete_remote_snapshot_is_logged_then_mined(self):
         fixture = self.prepare_hub_snapshot()
         (fixture / 'artifacts/workspace.zip').unlink()
-        result = self.run_script('pipeline-benchmarks.sh', 1)
-        self.assertIn('HTTP 404', result.stderr)
-        self.assertFalse((self.mining / 'corpus').exists())
-        self.assertFalse((self.root / 'downloads').exists())
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assert_logged_and_mined(result, 'HTTP 404')
 
-    def test_incompatible_snapshot_vm_stops_before_large_download(self):
+    def test_incompatible_snapshot_vm_stops_download_and_is_mined(self):
         fixture = self.prepare_hub_snapshot()
         path = fixture / 'snapshot.json'
         data = json.loads(path.read_text())
         data['runtime']['os'] = 'IncompatibleOS'
         path.write_text(json.dumps(data))
         self.hub_checksums(fixture)
-        result = self.run_script('pipeline-benchmarks.sh', 1)
-        self.assertIn('Snapshot VM requires', result.stderr)
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assert_logged_and_mined(result, 'Snapshot VM requires')
         self.assertEqual((self.root / 'hf-requests').read_text().splitlines(), ['SHA256SUMS', 'snapshot.json'])
 
     def test_partial_local_mining_is_not_overwritten_by_download(self):
@@ -329,10 +344,8 @@ time.sleep(30)
         data['corpusSHA256'] = '0' * 64
         path.write_text(json.dumps(data))
         self.hub_checksums(fixture)
-        result = self.run_script('pipeline-benchmarks.sh', 1)
-        self.assertIn('Corpus provenance disagrees', result.stderr)
-        self.assertFalse((self.mining / 'corpus').exists())
-        self.assertFalse((self.mining / 'image').exists())
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assert_logged_and_mined(result, 'Corpus provenance disagrees')
 
     def test_insufficient_disk_stops_before_large_payloads(self):
         fixture = self.prepare_hub_snapshot()
@@ -424,7 +437,7 @@ time.sleep(30)
 
     def test_missing_corpus_is_mined_automatically_then_reused(self):
         result = self.run_script('pipeline-benchmarks.sh')
-        self.assertIn('Running pipeline-mine-training-data.sh', result.stdout)
+        self.assertIn('mining a new dataset with pipeline-mine-training-data.sh', result.stderr)
         self.assertTrue((self.mining / 'corpus/manifest.json').is_file())
         self.assertTrue((self.root / 'benchmark-complete').exists())
         saved = (self.mining / 'corpus/all.jsonl').read_bytes()
