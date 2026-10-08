@@ -42,7 +42,8 @@ class PackageWorkerTests(unittest.TestCase):
         (self.run / "training-config.json").write_text('{"epochs": 10}')
         for name in ("training", "validation", "test"):
             (self.run / f"{name}.jsonl").write_text('{}')
-        (self.run / "corpus.json").write_text("{}")
+        workers.atomic_json(self.run / "corpus.json", dict(rowsByPackage={
+            name: 10 * (i + 1) for i, name in enumerate(split["eligible"])}))
         self.manifest = workers.prepare(self.run, self.image)
 
     def checkpoints(self):

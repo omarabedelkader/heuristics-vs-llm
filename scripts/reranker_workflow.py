@@ -10,6 +10,15 @@ import time
 from ranking_corpus import load_split, sha256, write_json
 
 
+def export_onnx(model, example, path):
+    import torch
+    from features import INPUTS
+    torch.onnx.export(model, example, str(path),
+                      input_names=INPUTS, output_names=["logits"], opset_version=17,
+                      dynamic_axes={"candidate_ids": {0: "candidates"}, "features": {0: "candidates"},
+                                    "logits": {0: "candidates"}}, dynamo=False)
+
+
 def read_partition(path, split, partition):
     allowed = set(split[partition])
     rows = []
@@ -35,7 +44,7 @@ def train(args):
     validation = read_partition(args.validation, split, "validation")
     import numpy as np
     import torch
-    from features import SCHEMA, INPUTS, encode, request_from_row
+    from features import SCHEMA, encode, request_from_row
     from model import Ranker
     from serve import Runtime
 
@@ -99,10 +108,7 @@ def train(args):
     model.load_state_dict(best_state)
     model.eval()
     args.output.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(model, tensors(usable[0]), str(args.output / "ranker.onnx"),
-                      input_names=INPUTS, output_names=["logits"], opset_version=17,
-                      dynamic_axes={"candidate_ids": {0: "candidates"}, "features": {0: "candidates"},
-                                    "logits": {0: "candidates"}}, dynamo=False)
+    export_onnx(model, tensors(usable[0]), args.output / "ranker.onnx")
     metadata = dict(schema=SCHEMA, width=args.width, seed=split["seed"], epochs=args.epochs,
                     selection="validation-MRR", bestEpoch=best_epoch, validationMRR=best_score,
                     parameters=sum(p.numel() for p in model.parameters()),
@@ -128,6 +134,112 @@ def train(args):
                 expected = model(*(torch.from_numpy(v) for v in inputs.values())).numpy()
             np.testing.assert_allclose(runtime.session.run(None, inputs)[0], expected, rtol=1e-4, atol=1e-5)
     print(f"Selected epoch {best_epoch} using validation MRR only; ONNX parity passed", flush=True)
+
+
+def sample_lines(path, size, rng):
+    """Count rows and reservoir-sample raw lines; returns (rows, sample, read seconds)."""
+    start = time.perf_counter()
+    count, sample = 0, []
+    with path.open("rb") as source:
+        for line in source:
+            if not line.strip():
+                continue
+            count += 1
+            if len(sample) < size:
+                sample.append(line)
+            elif (slot := rng.randrange(count)) < size:
+                sample[slot] = line
+    return count, sample, time.perf_counter() - start
+
+
+def per_row(rows, action):
+    start = time.perf_counter()
+    for row in rows:
+        action(row)
+    return (time.perf_counter() - start) / max(len(rows), 1)
+
+
+def calibrate(args):
+    """Time real training, validation and test-ranking steps on sampled rows, predict
+    the full training/evaluation time, and export an UNTRAINED model whose only use is
+    timing the live re-ranker benchmark on calibration packages."""
+    split = load_split(args.split)
+    calibration_split = load_split(args.calibration_split, set(split["eligible"]))
+    import numpy as np
+    import torch
+    from features import SCHEMA, encode, request_from_row
+    from model import Ranker
+    from serve import Runtime
+
+    torch.set_num_threads(1)
+    torch.manual_seed(split["seed"])
+    rng = random.Random(split["seed"])
+    counts, rows, read_seconds = {}, {}, 0.0
+    for name, path in (("training", args.training), ("validation", args.validation), ("test", args.test)):
+        counts[name], sample, seconds = sample_lines(path, args.sample, rng)
+        read_seconds += seconds
+        start = time.perf_counter()
+        rows[name] = [json.loads(line) for line in sample]
+        counts[name + "ParseSeconds"] = (time.perf_counter() - start) / max(len(sample), 1)
+    usable = [r for r in rows["training"] if r["target"] in [c["name"] for c in r["candidates"]]]
+    if not usable or not rows["validation"] or not rows["test"]:
+        raise ValueError("Calibration needs positive training rows, validation rows and test rows")
+
+    def tensors(row, k=None):
+        return tuple(torch.from_numpy(v) for v in encode(request_from_row(row, k)).values())
+
+    model = Ranker(args.width)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+
+    def step(row):
+        target = [c["name"] for c in row["candidates"]].index(row["target"])
+        optimizer.zero_grad()
+        loss = torch.nn.functional.cross_entropy(model(*tensors(row))[None, :], torch.tensor([target]))
+        loss.backward()
+        optimizer.step()
+
+    def validate(row):
+        names = [c["name"] for c in row["candidates"]]
+        if not names:
+            return
+        with torch.inference_mode():
+            logits = model(*tensors(row))
+            np.argsort(-logits.numpy(), kind="stable")
+            if row["target"] in names:
+                torch.nn.functional.cross_entropy(logits[None, :], torch.tensor([names.index(row["target"])]))
+
+    encode_seconds = per_row(rows["training"] + rows["validation"], lambda r: encode(request_from_row(r)))
+    model.train()
+    per_row(usable[:5], step)
+    step_seconds = per_row(usable, step)
+    model.eval()
+    validation_seconds = per_row(rows["validation"], validate)
+    args.output.mkdir(parents=True, exist_ok=True)
+    export_onnx(model, tensors(usable[0]), args.output / "ranker.onnx")
+    write_json(args.output / "metadata.json", dict(schema=SCHEMA, width=args.width, seed=split["seed"],
+                                                   calibrationOnly=True, packageSplit=calibration_split))
+    runtime = Runtime(args.output)
+    rank_seconds = sum(per_row(rows["test"], lambda r: runtime.rank(request_from_row(r, k)))
+                       for k in (10, 20, 30, 50))
+    usable_rows = counts["training"] * len(usable) / len(rows["training"])
+    loaded = counts["training"] + counts["validation"]
+    read_per_row = read_seconds / max(loaded + counts["test"], 1)
+    training_seconds = (loaded * (read_per_row + encode_seconds)
+                        + counts["training"] * counts["trainingParseSeconds"]
+                        + counts["validation"] * counts["validationParseSeconds"]
+                        + args.epochs * usable_rows * step_seconds
+                        + (args.epochs + 1) * counts["validation"] * validation_seconds)
+    evaluation_seconds = counts["test"] * (read_per_row + counts["testParseSeconds"] + rank_seconds)
+    write_json(args.report, dict(
+        trainingSeconds=training_seconds, evaluationSeconds=evaluation_seconds,
+        trainingDetail=(f"{args.epochs} epochs x {round(usable_rows):,} usable rows "
+                        f"({step_seconds * 1000:.1f} ms/step), {counts['validation']:,} validation rows"),
+        evaluationDetail=f"{counts['test']:,} test rows x K=10/20/30/50 ({rank_seconds * 1000:.1f} ms/row)",
+        rows={name: counts[name] for name in ("training", "validation", "test")},
+        sample=args.sample, stepSeconds=step_seconds, validationSeconds=validation_seconds,
+        encodeSeconds=encode_seconds, rankSeconds=rank_seconds))
+    print(f"Calibrated training: ~{training_seconds / 60:.0f} min; test evaluation: ~{evaluation_seconds / 60:.0f} min",
+          flush=True)
 
 
 def rank_bucket(rank):
@@ -245,7 +357,8 @@ def main():
     training = sub.add_parser("train")
     testing = sub.add_parser("evaluate")
     plotting = sub.add_parser("report")
-    for command in (training, testing):
+    timing = sub.add_parser("calibrate")
+    for command in (training, testing, timing):
         command.add_argument("--repository", required=True, type=Path)
         command.add_argument("--split", required=True, type=Path)
     training.add_argument("--training", required=True, type=Path)
@@ -259,13 +372,18 @@ def main():
     plotting.add_argument("--model", required=True, type=Path)
     plotting.add_argument("--evaluation", required=True, type=Path)
     plotting.add_argument("--output", required=True, type=Path)
+    for option in ("--training", "--validation", "--test", "--calibration-split", "--output", "--report"):
+        timing.add_argument(option, required=True, type=Path)
+    timing.add_argument("--epochs", type=int, default=10)
+    timing.add_argument("--width", type=int, choices=(16, 32, 64), default=32)
+    timing.add_argument("--sample", type=int, default=300)
     args = parser.parse_args()
     if args.action == "train" and args.epochs < 1:
         parser.error("epochs must be positive")
     if hasattr(args, "repository"):
         sys.path.insert(0, str(args.repository.resolve() / "reranker"))
     try:
-        {"train": train, "evaluate": evaluate, "report": report}[args.action](args)
+        {"train": train, "evaluate": evaluate, "report": report, "calibrate": calibrate}[args.action](args)
     except (ValueError, OSError, KeyError, TypeError) as error:
         print(f"Re-ranker workflow error: {error}", file=sys.stderr)
         return 1

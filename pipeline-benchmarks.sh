@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-#OAR -q default
-#OAR -p chirop
-#OAR -l host=1,walltime=14:00:00
-#OAR -n heuristic-reranker-benchmark
-#OAR -O heuristic-reranker.%jobid%.out
-#OAR -E heuristic-reranker.%jobid%.err
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_RERANKER_BENCHMARKS=0
+ESTIMATE=run
 for option in "$@"; do
     case "$option" in
         --skip-reranker-benchmarks) SKIP_RERANKER_BENCHMARKS=1 ;;
+        --estimate-only) ESTIMATE=only ;;
+        --skip-estimate) ESTIMATE=skip ;;
         --help|-h)
-            echo "Usage: BENCHMARK_JOBS=N $0 [--skip-reranker-benchmarks]"
-            echo "Skip only live neural re-ranker benchmarks; training, validation, test and learning figures still run."
+            echo "Usage: BENCHMARK_JOBS=N $0 [--skip-reranker-benchmarks] [--estimate-only | --skip-estimate]"
+            echo "--skip-reranker-benchmarks: skip only live neural re-ranker benchmarks; training, validation, test and learning figures still run."
+            echo "--estimate-only: prepare, time a few training packages on this machine, print the predicted runtime, then stop."
+            echo "--skip-estimate: start benchmarks without the runtime estimate (no calibration)."
             exit 0 ;;
         *) echo "Unknown option: $option (use --help)" >&2; exit 2 ;;
     esac
@@ -48,6 +48,12 @@ export RANKING_SPLIT_RATIOS="${RANKING_SPLIT_RATIOS:-80,10,10}"
 export BENCHMARK_PACKAGE_COUNT="${BENCHMARK_PACKAGE_COUNT:-}"
 export RANKING_SEED="${RANKING_SEED:-}"
 export RANKING_EPOCHS="${RANKING_EPOCHS:-10}"
+# Optional: train on only this many (seeded random) training packages; empty = all.
+export TRAINING_PACKAGE_COUNT="${TRAINING_PACKAGE_COUNT:-}"
+if [[ -n "$TRAINING_PACKAGE_COUNT" && ! "$TRAINING_PACKAGE_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TRAINING_PACKAGE_COUNT must be a positive integer (or unset to train on all training packages)." >&2
+    exit 1
+fi
 if [[ ! "$RANKING_EPOCHS" =~ ^[1-9][0-9]*$ ]]; then
     echo "RANKING_EPOCHS must be a positive integer." >&2
     exit 1
@@ -174,7 +180,7 @@ cd "$EXPERIMENT_DIR/image"
 # settings request a new selection through the existing Pharo selection workflow.
 if [[ ! -e "$BENCHMARK_SELECTION_FILE" && ! -e "$BENCHMARK_SPLIT_FILE" &&
       -f "$MINING_DIR/snapshot-selection/split.json" &&
-      -z "$BENCHMARK_PACKAGE_COUNT" && -z "$RANKING_SEED" &&
+      -z "$BENCHMARK_PACKAGE_COUNT" && -z "$RANKING_SEED" && -z "$TRAINING_PACKAGE_COUNT" &&
       "$RANKING_SPLIT_RATIOS" == "80,10,10" ]]; then
     cp "$MINING_DIR/snapshot-selection/benchmark-selection.json" "$BENCHMARK_SELECTION_FILE"
     cp "$MINING_DIR/snapshot-selection/split.json" "$BENCHMARK_SPLIT_FILE"
@@ -214,7 +220,8 @@ Stdio stdout
 # The selection file adapts the existing Pharo API; split.json is the authoritative four-way split.
 "${RERANKER_PYTHON:-python3}" "$SCRIPT_DIR/scripts/ranking_corpus.py" split \
     "$RANKING_CORPUS_DIR" --selection "$BENCHMARK_SELECTION_FILE" \
-    --output "$BENCHMARK_SPLIT_FILE" --ratios "$RANKING_SPLIT_RATIOS"
+    --output "$BENCHMARK_SPLIT_FILE" --ratios "$RANKING_SPLIT_RATIOS" \
+    ${TRAINING_PACKAGE_COUNT:+--training-packages "$TRAINING_PACKAGE_COUNT"}
 
 # New invocations train once. Explicit resumes retain the same model and results.
 if [[ -n "${BENCHMARK_RESUME_DIR:-}" ]]; then
@@ -256,6 +263,61 @@ fi
 
 "$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" prepare \
     --run "$RERANKER_RUN_DIR" --image "$EXPERIMENT_DIR/image"
+
+# Serve a model on port 8765 and exercise actual ONNX inference before use.
+start_reranker() {
+    "$RERANKER_PYTHON" "$REPO_DIR/reranker/serve.py" "$1" > "$2" 2>&1 &
+    RERANKER_PID=$!
+    if ! "$RERANKER_PYTHON" - "$1" "$RERANKER_PID" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+
+model_id = hashlib.sha256((Path(sys.argv[1]) / "ranker.onnx").read_bytes()).hexdigest()
+payload = json.dumps({
+    "schema": "coo-ranking-v1", "kind": "messages", "prefix": "si",
+    "sourcePrefix": "example ^ self si", "receiverKind": "self",
+    "candidates": [{"name": "size", "rank": 1}],
+}).encode()
+deadline = time.monotonic() + 60
+while time.monotonic() < deadline:
+    os.kill(int(sys.argv[2]), 0)
+    try:
+        request = Request("http://127.0.0.1:8765/rank", data=payload,
+                          headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=2) as response:
+            result = json.load(response)
+        if (result.get("schema") != "coo-ranking-v1"
+                or result.get("modelId") != model_id
+                or result.get("scores") != [["size", 1.0]]):
+            raise SystemExit("Unexpected reranker response or another model is using port 8765")
+        print("RE-RANKER READY")
+        break
+    except (URLError, TimeoutError):
+        time.sleep(1)
+else:
+    raise SystemExit("Re-ranker did not become ready within 60 seconds")
+PY
+    then
+        cat "$2" >&2
+        exit 1
+    fi
+    if ! kill -0 "$RERANKER_PID" 2>/dev/null; then
+        cat "$2" >&2
+        exit 1
+    fi
+}
+
+stop_reranker() {
+    kill "$RERANKER_PID" 2>/dev/null || true
+    wait "$RERANKER_PID" 2>/dev/null || true
+    RERANKER_PID=""
+}
 
 run_package_phase() {
     "$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" run \
@@ -337,6 +399,41 @@ fi
 "$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/ollama_models.py" \
     "$EXPERIMENT_DIR/llm-models.json" "$RERANKER_RUN_DIR/ollama-tags.json"
 
+# Predict the runtime before the long phases. Calibration times real workers on a few
+# small TRAINING packages (never benchmark packages) at BENCHMARK_JOBS concurrency,
+# times sampled training steps, and serves an untrained model only to time NeuralRank.
+if [[ "$ESTIMATE" != skip ]]; then
+    CALIBRATION_DIR="$RERANKER_RUN_DIR/calibration"
+    echo "Estimating runtime: timing small training packages at $BENCHMARK_JOBS jobs (takes minutes)"
+    "$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" calibrate \
+        --run "$RERANKER_RUN_DIR" --image "$EXPERIMENT_DIR/image" --phase normal --jobs "$BENCHMARK_JOBS"
+    if [[ ! -f "$CALIBRATION_DIR/training.json" ]]; then
+        "$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/reranker_workflow.py" calibrate \
+            --repository "$REPO_DIR" --split "$RERANKER_RUN_DIR/split.json" \
+            --calibration-split "$CALIBRATION_DIR/split.json" \
+            --training "$RERANKER_RUN_DIR/training.jsonl" --validation "$RERANKER_RUN_DIR/validation.jsonl" \
+            --test "$RERANKER_RUN_DIR/test.jsonl" --epochs "$RANKING_EPOCHS" --width 32 \
+            --output "$CALIBRATION_DIR/model" --report "$CALIBRATION_DIR/training.json"
+    fi
+    estimate_options=(--run "$RERANKER_RUN_DIR" --jobs "$BENCHMARK_JOBS")
+    if [[ "$SKIP_RERANKER_BENCHMARKS" == 0 ]]; then
+        if [[ ! -f "$CALIBRATION_DIR/reranker.json" ]]; then
+            start_reranker "$CALIBRATION_DIR/model" "$CALIBRATION_DIR/reranker-server.log"
+            "$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" calibrate \
+                --run "$RERANKER_RUN_DIR" --image "$EXPERIMENT_DIR/image" --phase reranker --jobs "$BENCHMARK_JOBS"
+            stop_reranker
+        fi
+    else
+        estimate_options+=(--normal-only)
+    fi
+    "$RERANKER_PYTHON" "$SCRIPT_DIR/scripts/runtime_estimate.py" "${estimate_options[@]}" --elapsed "$SECONDS"
+    if [[ "$ESTIMATE" == only ]]; then
+        echo "Estimate only: no benchmark package was run. To run this exact prepared experiment:"
+        echo "  BENCHMARK_RESUME_DIR=\"$RERANKER_RUN_DIR\" BENCHMARK_JOBS=$BENCHMARK_JOBS $0"
+        exit 0
+    fi
+fi
+
 echo "Running baseline, dependency, LLM completion and hybrid benchmarks on the saved packages"
 run_package_phase normal
 
@@ -385,54 +482,7 @@ done
 
 if [[ "$SKIP_RERANKER_BENCHMARKS" == 0 ]]; then
 echo "Starting re-ranker"
-"$RERANKER_PYTHON" "$REPO_DIR/reranker/serve.py" "$RERANKER_MODEL_DIR" > "$RERANKER_RUN_DIR/reranker.log" 2>&1 &
-RERANKER_PID=$!
-
-# Exercise actual ONNX inference and check that the requested model is serving.
-if ! "$RERANKER_PYTHON" - "$RERANKER_MODEL_DIR" "$RERANKER_PID" <<'PY'
-import hashlib
-import json
-import os
-from pathlib import Path
-import sys
-import time
-from urllib.error import URLError
-from urllib.request import Request, urlopen
-
-model_id = hashlib.sha256((Path(sys.argv[1]) / "ranker.onnx").read_bytes()).hexdigest()
-payload = json.dumps({
-    "schema": "coo-ranking-v1", "kind": "messages", "prefix": "si",
-    "sourcePrefix": "example ^ self si", "receiverKind": "self",
-    "candidates": [{"name": "size", "rank": 1}],
-}).encode()
-deadline = time.monotonic() + 60
-while time.monotonic() < deadline:
-    os.kill(int(sys.argv[2]), 0)
-    try:
-        request = Request("http://127.0.0.1:8765/rank", data=payload,
-                          headers={"Content-Type": "application/json"})
-        with urlopen(request, timeout=2) as response:
-            result = json.load(response)
-        if (result.get("schema") != "coo-ranking-v1"
-                or result.get("modelId") != model_id
-                or result.get("scores") != [["size", 1.0]]):
-            raise SystemExit("Unexpected reranker response or another model is using port 8765")
-        print("RE-RANKER READY")
-        break
-    except (URLError, TimeoutError):
-        time.sleep(1)
-else:
-    raise SystemExit("Re-ranker did not become ready within 60 seconds")
-PY
-then
-    cat "$RERANKER_RUN_DIR/reranker.log" >&2
-    exit 1
-fi
-
-if ! kill -0 "$RERANKER_PID" 2>/dev/null; then
-    cat "$RERANKER_RUN_DIR/reranker.log" >&2
-    exit 1
-fi
+start_reranker "$RERANKER_MODEL_DIR" "$RERANKER_RUN_DIR/reranker.log"
 
 echo "Running re-ranking benchmarks on the saved benchmark packages"
 run_package_phase reranker
@@ -476,3 +526,7 @@ if [[ "$SKIP_RERANKER_BENCHMARKS" == 1 ]]; then
 fi
 echo "Requested benchmarks complete. Published ${#publication_files[@]} files: $RESULTS_DIR"
 echo "Model, train/validation/test corpora, split, learning figures, evaluation and logs: $RERANKER_RUN_DIR"
+if [[ -f "$RERANKER_RUN_DIR/estimate.json" ]]; then
+    "$RERANKER_PYTHON" -c 'import json, sys; e = json.load(open(sys.argv[1])); print("Predicted total: %.1f h; this invocation took: %.1f h (per-package times: timings.jsonl)" % (e["totalSeconds"] / 3600, int(sys.argv[2]) / 3600))' \
+        "$RERANKER_RUN_DIR/estimate.json" "$SECONDS"
+fi

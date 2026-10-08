@@ -160,6 +160,17 @@ if Path(args[0]).name == 'reranker_workflow.py':
         assert {row['group'] for row in rows} == set(split['test'])
         assert not ({row['group'] for row in rows} & set(split['benchmark']))
         Path(args[args.index('--output') + 1]).write_text('{}')
+    elif action == 'calibrate':
+        assert not (Path(os.environ['RERANKER_RUN_DIR']) / 'packages').exists(), 'Calibration precedes benchmarks'
+        model = Path(args[args.index('--output') + 1])
+        model.mkdir()
+        (model / 'ranker.onnx').write_bytes(b'untrained')
+        (model / 'metadata.json').write_text(Path(args[args.index('--calibration-split') + 1]).read_text())
+        Path(args[args.index('--report') + 1]).write_text(json.dumps(dict(
+            trainingSeconds=7200.0, evaluationSeconds=600.0,
+            trainingDetail='stand-in training', evaluationDetail='stand-in evaluation')))
+        with (root / 'training-calls').open('a') as out:
+            out.write('calibrate\\n')
     elif action == 'report':
         directory = Path(args[args.index('--output') + 1])
         directory.mkdir(exist_ok=True)
@@ -197,7 +208,10 @@ time.sleep(30)
         path.write_text(f"#!{sys.executable}\n" + body)
         path.chmod(0o755)
 
-    def run_script(self, name, expected=0, args=()):
+    def run_script(self, name, expected=0, args=(), estimate=False):
+        # The runtime estimate has dedicated tests; elsewhere it would only add calls.
+        if name == 'pipeline-benchmarks.sh' and not estimate:
+            args = ['--skip-estimate', *args]
         result = subprocess.run(["bash", str(ROOT / name), *args], env=self.env,
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
@@ -403,6 +417,73 @@ time.sleep(30)
             result = self.run_script('pipeline-benchmarks.sh', 1)
             self.assertIn('BENCHMARK_JOBS', result.stderr)
             self.assertFalse((self.root / 'downloads').exists())
+
+    def test_estimate_only_times_training_packages_then_resume_reuses_calibration(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        result = self.run_script('pipeline-benchmarks.sh', args=['--estimate-only'], estimate=True)
+        self.assertIn('RUNTIME ESTIMATE for this machine with BENCHMARK_JOBS=2', result.stdout)
+        self.assertIn('RENT AT LEAST', result.stdout)
+        self.assertIn('re-ranker training', result.stdout)
+        self.assertIn('Estimate only: no benchmark package was run', result.stdout)
+        run = next(self.experiment.glob('reranker-run.*'))
+        split = json.loads((run / 'split.json').read_text())
+        info = json.loads((run / 'calibration/info.json').read_text())
+        self.assertEqual(len(info['packages']), 2)
+        self.assertLessEqual(set(info['packages']), set(split['train']))
+        self.assertFalse((run / 'packages').exists())
+        self.assertFalse((self.root / 'benchmark-complete').exists())
+        self.assertEqual(list((run / 'calibration/packages').glob('*/image')), [])
+        estimate = json.loads((run / 'estimate.json').read_text())
+        self.assertEqual([s['stage'] for s in estimate['stages']], [
+            'normal benchmarks', 're-ranker training', 'test evaluation', 'reranker benchmarks'])
+        self.assertGreater(estimate['recommendedSeconds'], estimate['totalSeconds'])
+        calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
+        timed = [c for c in calls if 'coo-package-result-v1' in c['code']]
+        self.assertEqual(len(timed), 4)
+        self.assertTrue(all('/calibration/packages/' in c['cwd'] for c in timed))
+        self.assertEqual((self.root / 'reranker-server-calls').read_text().splitlines(), ['serve'])
+
+        self.env['BENCHMARK_RESUME_DIR'] = str(run)
+        result = self.run_script('pipeline-benchmarks.sh', estimate=True)
+        self.assertIn('Reusing saved timings', result.stdout)
+        self.assertLess(result.stdout.index('RUNTIME ESTIMATE'), result.stdout.index('Running baseline'))
+        self.assertIn('Predicted total:', result.stdout)
+        self.assertTrue((self.root / 'benchmark-complete').exists())
+        self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['calibrate', 'train'])
+        calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
+        self.assertEqual(sum('/calibration/packages/' in c['cwd'] for c in calls), 4)
+        timings = [json.loads(line) for line in (run / 'timings.jsonl').read_text().splitlines()]
+        self.assertEqual([t['phase'] for t in timings], ['normal', 'reranker'])
+
+    def test_training_package_count_limits_training_and_is_pinned(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        self.env['TRAINING_PACKAGE_COUNT'] = '1'
+        result = self.run_script('pipeline-benchmarks.sh', estimate=True)
+        self.assertIn('unused=2', result.stdout)
+        self.assertIn('RUNTIME ESTIMATE', result.stdout)
+        self.assertTrue((self.root / 'benchmark-complete').exists())
+        run = next(self.experiment.glob('reranker-run.*'))
+        split = json.loads((run / 'split.json').read_text())
+        self.assertEqual(len(split['train']), 1)
+        self.assertEqual(split['trainingPackageCount'], 1)
+        groups = {json.loads(line)['group'] for line in (run / 'training.jsonl').read_text().splitlines()}
+        self.assertEqual(groups, set(split['train']))
+        self.env['TRAINING_PACKAGE_COUNT'] = '2'
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn('TRAINING_PACKAGE_COUNT', result.stderr)
+        self.env['TRAINING_PACKAGE_COUNT'] = 'many'
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn('TRAINING_PACKAGE_COUNT must be a positive integer', result.stderr)
+
+    def test_estimate_respects_skip_reranker_benchmarks(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        self.run_script('pipeline-benchmarks.sh', args=['--estimate-only', '--skip-reranker-benchmarks'],
+                        estimate=True)
+        run = next(self.experiment.glob('reranker-run.*'))
+        estimate = json.loads((run / 'estimate.json').read_text())
+        self.assertNotIn('reranker benchmarks', [s['stage'] for s in estimate['stages']])
+        self.assertFalse((self.root / 'reranker-server-calls').exists())
+        self.assertFalse((run / 'calibration/reranker.json').exists())
 
     def test_resume_uses_same_model_and_completed_package_results(self):
         self.run_script('pipeline-mine-training-data.sh')

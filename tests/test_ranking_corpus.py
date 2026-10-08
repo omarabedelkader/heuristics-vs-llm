@@ -105,6 +105,45 @@ class CorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ratios"):
             corpus.create_split(self.data, selection, self.root / "new-split.json", (70, 15, 15))
 
+    def test_training_package_count_keeps_seeded_subset_and_excludes_the_rest(self):
+        self.finalize()
+        selection = self.root / "selection.json"
+        corpus.write_json(selection, dict(eligible=self.packages, benchmark=["Benchmark"], seed=42))
+        full = corpus.create_split(self.data, selection, self.root / "full-split.json")
+        limited = corpus.create_split(self.data, selection, self.root / "limited-split.json",
+                                      training_packages=2)
+        self.assertEqual(limited, corpus.create_split(self.data, selection, self.root / "again.json",
+                                                      training_packages=2))
+        self.assertEqual(len(limited["train"]), 2)
+        self.assertEqual(len(limited["unused"]), 1)
+        self.assertEqual(set(limited["train"]) | set(limited["unused"]), set(full["train"]))
+        for key in ("validation", "test", "benchmark"):
+            self.assertEqual(limited[key], full[key])
+        self.assertEqual(limited["trainingPackageCount"], 2)
+        with self.assertRaisesRegex(ValueError, "TRAINING_PACKAGE_COUNT"):
+            corpus.create_split(self.data, selection, self.root / "limited-split.json", training_packages=1)
+        with self.assertRaisesRegex(ValueError, "between 1 and 3"):
+            corpus.create_split(self.data, selection, self.root / "too-many.json", training_packages=4)
+
+    def test_unused_packages_enter_no_model_development_file(self):
+        self.finalize()
+        self.split.update(train=["Train-A"], unused=["Train-B", "No-Rows"], trainingPackageCount=1)
+        self.write_split()
+        audit = self.partition()
+        for name, groups in (("training", {"Train-A"}), ("validation", {"Validation"}), ("test", {"Test"})):
+            rows = (self.output / f"{name}.jsonl").read_text().splitlines()
+            self.assertEqual({json.loads(line)["group"] for line in rows}, groups)
+        self.assertEqual(audit["trainingRows"], 1)
+        self.assertEqual(audit["excludedUnusedRows"], 1)
+        self.assertEqual(audit["excludedBenchmarkRows"], 2)
+
+    def test_unused_packages_must_not_overlap_other_partitions(self):
+        self.split.update(unused=["Train-A"])
+        with self.assertRaisesRegex(ValueError, "mutually disjoint"):
+            corpus.validate_split(self.split)
+        self.split.update(train=["Train-B", "No-Rows"])
+        self.assertEqual(corpus.validate_split(self.split), self.split)
+
     def test_legacy_two_way_split_is_rejected(self):
         self.finalize()
         self.split["schema"] = "coo-package-split-v1"

@@ -59,15 +59,18 @@ def validate_split(split, eligible=None):
     if split.get("schema") != "coo-package-split-v2" or type(split.get("seed")) is not int:
         raise ValueError("A four-part coo-package-split-v2 split is required; use a new EXPERIMENT_DIR for older runs")
     pools = {key: package_names(split.get(key), key) for key in ("eligible", *PARTITIONS)}
+    # Packages left out by TRAINING_PACKAGE_COUNT; absent or empty otherwise.
+    unused = split.get("unused", [])
+    pools["unused"] = package_names(unused, "unused") if unused else set()
     if eligible is not None and pools["eligible"] != eligible:
         raise ValueError("Saved split and prepared corpus have different package pools")
     seen = set()
-    for key in PARTITIONS:
+    for key in (*PARTITIONS, "unused"):
         if seen & pools[key]:
-            raise ValueError("Train, validation, test and benchmark packages must be mutually disjoint")
+            raise ValueError("Train, validation, test, benchmark and unused packages must be mutually disjoint")
         seen.update(pools[key])
     if seen != pools["eligible"]:
-        raise ValueError("The four partitions must contain every eligible package exactly once")
+        raise ValueError("The partitions must contain every eligible package exactly once")
     return split
 
 
@@ -75,8 +78,11 @@ def load_split(path, eligible=None):
     return validate_split(read_json(path), eligible)
 
 
-def create_split(corpus, selection_path, output, ratios=(80, 10, 10)):
-    """Reserve the saved benchmark selection, then split only the remaining packages."""
+def create_split(corpus, selection_path, output, ratios=(80, 10, 10), training_packages=None):
+    """Reserve the saved benchmark selection, then split only the remaining packages.
+
+    training_packages keeps only that many (seeded random) training packages; the
+    others are recorded as unused and enter no model-development file."""
     _, eligible = load_manifest(corpus)
     selection = read_json(selection_path)
     if package_names(selection.get("eligible"), "selection eligible") != eligible:
@@ -89,8 +95,10 @@ def create_split(corpus, selection_path, output, ratios=(80, 10, 10)):
     if output.exists():
         split = load_split(output, eligible)
         if (set(split["benchmark"]) != benchmark or split["seed"] != selection["seed"]
-                or split.get("ratios") != list(ratios)):
-            raise ValueError("Saved split differs from selection or ratios; use a new EXPERIMENT_DIR")
+                or split.get("ratios") != list(ratios)
+                or split.get("trainingPackageCount") != training_packages):
+            raise ValueError("Saved split differs from selection, ratios or TRAINING_PACKAGE_COUNT; "
+                             "use a new EXPERIMENT_DIR")
         return split
     remaining = sorted(eligible - benchmark)
     if len(remaining) < 3:
@@ -107,10 +115,18 @@ def create_split(corpus, selection_path, output, ratios=(80, 10, 10)):
             counts[donor] -= 1
             counts[index] = 1
     train_end, validation_end = counts[0], counts[0] + counts[1]
+    train = remaining[:train_end]
     split = dict(schema="coo-package-split-v2", seed=selection["seed"], ratios=list(ratios),
                  eligible=sorted(eligible), benchmark=selection["benchmark"],
-                 train=sorted(remaining[:train_end]), validation=sorted(remaining[train_end:validation_end]),
+                 train=sorted(train), validation=sorted(remaining[train_end:validation_end]),
                  test=sorted(remaining[validation_end:]))
+    if training_packages is not None:
+        if type(training_packages) is not int or not 0 < training_packages <= len(train):
+            raise ValueError(f"TRAINING_PACKAGE_COUNT must be between 1 and {len(train)} "
+                             "(the training packages available after the split)")
+        # `remaining` is already seeded-shuffled, so a prefix is a random subset.
+        split.update(train=sorted(train[:training_packages]), unused=sorted(train[training_packages:]),
+                     trainingPackageCount=training_packages)
     validate_split(split, eligible)
     write_json(output, split)
     return split
@@ -201,12 +217,12 @@ def partition(corpus, image, split_path, output, repository=None):
             counts, digest = scan_rows(corpus / "all.jsonl", eligible, destinations, outputs)
         if digest != manifest.get("corpusSHA256") or counts != manifest["rowsByPackage"]:
             raise ValueError("Prepared corpus checksum/count mismatch; restore the complete corpus")
-        row_counts = {key: sum(counts[name] for name in split[key]) for key in PARTITIONS}
+        row_counts = {key: sum(counts[name] for name in split.get(key, [])) for key in (*PARTITIONS, "unused")}
         if any(row_counts[key] == 0 for key in FILES):
             raise ValueError("Saved split must have nonempty train, validation and test data; no packages were redrawn")
         audit = dict(manifest, packageSplit=split, trainingRows=row_counts["train"],
                      validationRows=row_counts["validation"], testRows=row_counts["test"],
-                     excludedBenchmarkRows=row_counts["benchmark"])
+                     excludedBenchmarkRows=row_counts["benchmark"], excludedUnusedRows=row_counts["unused"])
         audit["partitionSHA256"] = {name: sha256(stage / f"{name}.jsonl") for name in FILES.values()}
         write_json(stage / "corpus.json", audit)
         for name in ("training.jsonl", "validation.jsonl", "test.jsonl", "corpus.json"):
@@ -224,6 +240,7 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--selection", type=Path)
     parser.add_argument("--ratios", default="80,10,10")
+    parser.add_argument("--training-packages", type=int, help="Keep only this many training packages")
     args = parser.parse_args()
     if args.action == "finalize" and args.image is None:
         parser.error("finalize requires --image")
@@ -234,8 +251,9 @@ def main():
     try:
         if args.action == "split":
             result = create_split(args.corpus, args.selection, args.output,
-                                  tuple(int(n) for n in args.ratios.split(",")))
-            print("Package partitions: " + ", ".join(f"{key}={len(result[key])}" for key in PARTITIONS))
+                                  tuple(int(n) for n in args.ratios.split(",")), args.training_packages)
+            print("Package partitions: " + ", ".join(f"{key}={len(result.get(key, []))}"
+                                                     for key in (*PARTITIONS, "unused")))
             return 0
         if args.action == "finalize":
             result = finalize(args.corpus, args.image, args.repository)
@@ -249,7 +267,8 @@ def main():
     print(f"Corpus {args.action}: {result['rows']} rows across {len(result['eligible'])} packages")
     if args.action == "partition":
         print(f"Training: {result['trainingRows']}; validation: {result['validationRows']}; "
-              f"test: {result['testRows']}; excluded benchmark rows: {result['excludedBenchmarkRows']}")
+              f"test: {result['testRows']}; excluded benchmark rows: {result['excludedBenchmarkRows']}; "
+              f"unused rows (TRAINING_PACKAGE_COUNT): {result['excludedUnusedRows']}")
     return 0
 
 

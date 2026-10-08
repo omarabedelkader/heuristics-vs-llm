@@ -11,7 +11,8 @@ import sys
 import time
 import uuid
 
-from ranking_corpus import load_split, read_json, sha256
+from ranking_corpus import load_split, read_json, sha256, validate_split
+from runtime_estimate import calibration_packages
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -151,10 +152,62 @@ def stop_processes(active):
         log.close()
 
 
+def launch(image, directory, package, phase, run_id, split_path, code):
+    """Start one isolated Pharo worker; returns (process, log, pending result path)."""
+    working = directory / "image"
+    copy_image(image, working)
+    atomic_json(directory / "package.json", {"package": package})
+    temporary = directory / f"{phase}.pending.json"
+    temporary.unlink(missing_ok=True)
+    env = dict(os.environ, BENCHMARK_PACKAGE=package, BENCHMARK_PHASE=phase,
+               BENCHMARK_RUN_ID=run_id, BENCHMARK_OUTPUT=str(temporary),
+               BENCHMARK_SPLIT_FILE=str(split_path))
+    log = (directory / f"{phase}.log").open("w")
+    try:
+        process = subprocess.Popen(
+            [str(image / "pharo"), "--headless", "Pharo.image",
+             "--no-default-preferences", "eval", code],
+            cwd=working, env=env, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True)
+    except BaseException:
+        log.close()
+        raise
+    return process, log, temporary
+
+
+def execute(pending, jobs, phase, start, finish):
+    """Keep at most `jobs` workers running, starting the next package as a slot frees.
+
+    start(index, package) -> (process, log, temporary);
+    finish(index, package, temporary, seconds) validates and keeps the result."""
+    active = {}
+    try:
+        while pending or active:
+            for index, (process, log, package, temporary, started) in list(active.items()):
+                status = process.poll()
+                if status is None:
+                    continue
+                log.close()
+                if status:
+                    raise RuntimeError(f"{phase} failed for {package} (exit {status}); see {log.name}")
+                finish(index, package, temporary, time.monotonic() - started)
+                del active[index]
+            while pending and len(active) < jobs:
+                index, package = pending.pop(0)
+                process, log, temporary = start(index, package)
+                active[index] = (process, log, package, temporary, time.monotonic())
+                print(f"[{phase}] Started {package} ({len(active)}/{jobs} slots)", flush=True)
+            if active:
+                time.sleep(0.1)
+    finally:
+        stop_processes(active)
+
+
 def run_workers(run, image, phase, jobs):
     manifest = prepare(run, image)
     if phase == "reranker":
         pin_model(run)
+    rows = read_json(run / "corpus.json")["rowsByPackage"]
     pending = []
     for index, package in enumerate(manifest["packages"]):
         directory = package_directory(run, index)
@@ -165,51 +218,76 @@ def run_workers(run, image, phase, jobs):
         else:
             pending.append((index, package))
     code = (SCRIPTS / "benchmark-package.st").read_text()
-    active = {}
     # Record the user-selected cap for each invocation (including resumed runs).
     with (run / "worker-invocations.jsonl").open("a") as out:
         out.write(json.dumps(dict(phase=phase, jobs=jobs, pending=len(pending), time=time.time())) + "\n")
-    try:
-        while pending or active:
-            for index, (process, log, package, temporary, result) in list(active.items()):
-                status = process.poll()
-                if status is None:
-                    continue
-                log.close()
-                if status:
-                    raise RuntimeError(f"{phase} failed for {package} (exit {status}); see {log.name}")
-                validate_result(temporary, package, phase, manifest["runId"])
-                temporary.replace(result)
-                del active[index]
-                print(f"[{phase}] Finished {package}: {result}", flush=True)
-            while pending and len(active) < jobs:
-                index, package = pending.pop(0)
-                directory = package_directory(run, index)
-                working = directory / "image"
-                copy_image(image, working)
-                atomic_json(directory / "package.json", {"package": package})
-                temporary = directory / f"{phase}.pending.json"
-                temporary.unlink(missing_ok=True)
-                result = directory / f"{phase}.json"
-                env = dict(os.environ, BENCHMARK_PACKAGE=package, BENCHMARK_PHASE=phase,
-                           BENCHMARK_RUN_ID=manifest["runId"], BENCHMARK_OUTPUT=str(temporary),
-                           BENCHMARK_SPLIT_FILE=str(run / "split.json"))
-                log = (directory / f"{phase}.log").open("w")
-                try:
-                    process = subprocess.Popen(
-                        [str(image / "pharo"), "--headless", "Pharo.image",
-                         "--no-default-preferences", "eval", code],
-                        cwd=working, env=env, stdout=log, stderr=subprocess.STDOUT,
-                        start_new_session=True)
-                except BaseException:
-                    log.close()
-                    raise
-                active[index] = (process, log, package, temporary, result)
-                print(f"[{phase}] Started {package} ({len(active)}/{jobs} slots)", flush=True)
-            if active:
-                time.sleep(0.1)
-    finally:
-        stop_processes(active)
+
+    def start(index, package):
+        return launch(image, package_directory(run, index), package, phase,
+                      manifest["runId"], run / "split.json", code)
+
+    def finish(index, package, temporary, seconds):
+        validate_result(temporary, package, phase, manifest["runId"])
+        result = package_directory(run, index) / f"{phase}.json"
+        temporary.replace(result)
+        # Actual durations, to compare against estimate.json.
+        with (run / "timings.jsonl").open("a") as out:
+            out.write(json.dumps(dict(phase=phase, package=package, rows=rows[package],
+                                      seconds=seconds, jobs=jobs)) + "\n")
+        print(f"[{phase}] Finished {package} in {seconds / 60:.1f} min: {result}", flush=True)
+
+    execute(pending, jobs, phase, start, finish)
+
+
+def calibrate(run, image, phase, jobs):
+    """Time real workers on small TRAINING packages at the chosen concurrency.
+
+    Benchmark packages are never touched; results are discarded after timing."""
+    directory = run / "calibration"
+    info_path = directory / "info.json"
+    if phase == "normal" and not (info_path.exists() and read_json(info_path)["jobs"] == jobs):
+        shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir()
+        split = load_split(run / "split.json")
+        rows = read_json(run / "corpus.json")["rowsByPackage"]
+        unused = split.get("unused", [])
+        chosen = calibration_packages(split["train"] + unused, rows, max(jobs, 2))
+        # Only the chosen packages are worker targets; real benchmark packages are relabelled
+        # so the split stays a complete partition, and are never run here.
+        calibration_split = dict(split, benchmark=sorted(chosen),
+                                 train=sorted((set(split["train"]) - set(chosen)) | set(split["benchmark"])))
+        if "unused" in split:
+            calibration_split["unused"] = sorted(set(unused) - set(chosen))
+        validate_split(calibration_split)
+        atomic_json(directory / "split.json", calibration_split)
+        atomic_json(info_path, dict(jobs=jobs, runId=uuid.uuid4().hex, packages=chosen,
+                                    rows={name: rows[name] for name in chosen}))
+    info = read_json(info_path)
+    if info["jobs"] != jobs:
+        raise ValueError("Calibration concurrency differs; recalibrate the normal phase first")
+    output = directory / f"{phase}.json"
+    if output.exists():
+        print(f"[calibration {phase}] Reusing saved timings", flush=True)
+        return read_json(output)
+    code = (SCRIPTS / "benchmark-package.st").read_text()
+    records = []
+
+    def start(index, package):
+        return launch(image, directory / "packages" / f"{index + 1:04d}", package, phase,
+                      info["runId"], directory / "split.json", code)
+
+    def finish(index, package, temporary, seconds):
+        validate_result(temporary, package, phase, info["runId"])
+        records.append(dict(package=package, rows=info["rows"][package], seconds=seconds))
+        print(f"[calibration {phase}] {package}: {info['rows'][package]} examples in {seconds:.0f} s", flush=True)
+
+    started = time.monotonic()
+    execute(list(enumerate(info["packages"])), jobs, f"calibration {phase}", start, finish)
+    result = dict(jobs=jobs, wallSeconds=time.monotonic() - started, packages=records)
+    atomic_json(output, result)
+    for path in (directory / "packages").glob("*/image"):
+        shutil.rmtree(path)
+    return result
 
 
 def aggregate(run, image, normal_only=False):
@@ -249,15 +327,15 @@ def interrupted(signum, _frame):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "pin-model", "run", "aggregate"))
+    parser.add_argument("action", choices=("prepare", "pin-model", "run", "calibrate", "aggregate"))
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--phase", choices=tuple(STRATEGIES))
     parser.add_argument("--jobs", type=positive_jobs)
     parser.add_argument("--normal-only", action="store_true", help="Aggregate only normal benchmarks")
     args = parser.parse_args()
-    if args.action == "run" and (args.phase is None or args.jobs is None):
-        parser.error("run requires --phase and --jobs (no automatic concurrency)")
+    if args.action in ("run", "calibrate") and (args.phase is None or args.jobs is None):
+        parser.error(f"{args.action} requires --phase and --jobs (no automatic concurrency)")
     if args.normal_only and args.action != "aggregate":
         parser.error("--normal-only applies only to aggregate")
     signal.signal(signal.SIGTERM, interrupted)
@@ -269,6 +347,8 @@ def main():
             pin_model(args.run.resolve())
         elif args.action == "run":
             run_workers(args.run.resolve(), args.image.resolve(), args.phase, args.jobs)
+        elif args.action == "calibrate":
+            calibrate(args.run.resolve(), args.image.resolve(), args.phase, args.jobs)
         else:
             print(aggregate(args.run.resolve(), args.image.resolve(), args.normal_only))
     except KeyboardInterrupt:

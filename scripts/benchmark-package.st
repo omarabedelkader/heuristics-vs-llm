@@ -11,6 +11,10 @@ seen := Set new.
     (names isEmpty or: [ names asSet size ~= names size or: [ (seen intersection: names asSet) notEmpty ] ])
         ifTrue: [ Error signal: 'The four package partitions must be nonempty and disjoint' ].
     seen addAll: names ].
+"Packages left out by TRAINING_PACKAGE_COUNT; absent when every training package is used."
+(split at: 'unused' ifAbsent: [ #() ]) do: [ :name |
+    (seen includes: name) ifTrue: [ Error signal: 'Unused packages must not appear in another partition' ].
+    seen add: name ].
 seen = (split at: 'eligible') asSet ifFalse: [ Error signal: 'Incomplete package partitions' ].
 packageName := OSEnvironment current at: 'BENCHMARK_PACKAGE'.
 ((split at: 'benchmark') includes: packageName) ifFalse: [
