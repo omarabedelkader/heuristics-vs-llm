@@ -37,10 +37,14 @@ publication. The completed corpus is installed last. Archive launch permissions
 are preserved. The current pipeline scripts are never replaced by archived code.
 Download preparation uses the same mining lock as the mining script.
 
-The published VM is **macOS ARM64**. The downloader rejects an incompatible host
-before downloading the large payloads. On Linux/OAR, use a snapshot containing a
-compatible VM via the variables below, or explicitly run the mining script locally
-first. Local mining creates a new corpus and is not a reproduction of this snapshot.
+The published VM is **macOS ARM64**. On **Linux x86_64/OAR**, the pipeline installs
+the official Linux VM of the same version (`v12.0.5-beta`, commit `7884d28`), pinned
+by SHA-256 in `scripts/pharo_runtime.py`. The corpus, source and `Pharo.image` bytes
+remain unchanged. `image/runtime-origin.json` records the replacement VM URL,
+checksum and image checksum. This also handles an existing Mac snapshot copied to
+Linux. If the official stable download changes, its checksum mismatch stops the run
+until a replacement is deliberately validated and pinned. Other incompatible
+platforms are rejected. Benchmark timings can differ between platforms.
 Allow at least 32 GB free for restoration and training partitions, plus space for
 models and package workers. Interrupted/failed downloads clean up their staging
 files; existing mining files are never overwritten by a download.
@@ -204,10 +208,34 @@ in place. Models, logs, split and evaluation data stay under `experiment/`.
 After successful publication, the former `performance-re-ranker.png` filename is
 removed from the results folder in favor of `performance-reranker.png`.
 
-The previous standalone normal-benchmark, shared setup, and OAR job scripts have
-been removed. OAR directives now live in
-`pipeline-benchmarks.sh`, so it can be submitted directly using your usual OAR
-command. Deploy the `scripts/` directory alongside both shell scripts.
+`job.oar.sh` preserves the original local Ollama installation, persistent model
+cache, four model downloads, server startup and job logs. Its benchmark section
+now calls `pipeline-benchmarks.sh` once, which handles the complete workflow above.
+Edit these two defaults near the top of `job.oar.sh`:
+
+```bash
+export BENCHMARK_PACKAGE_COUNT="${BENCHMARK_PACKAGE_COUNT:-250}"
+export BENCHMARK_JOBS="${BENCHMARK_JOBS:-8}"
+```
+
+The first is the total number of reserved benchmark packages; the second is the
+maximum number of simultaneous package workers on the single allocated host.
+Environment settings override these defaults. For example, with a Linux host:
+
+```bash
+BENCHMARK_PACKAGE_COUNT=100 BENCHMARK_JOBS=4 bash ./job.oar.sh
+```
+
+Submit `job.oar.sh` with your usual OAR command. Deploy both pipeline scripts and
+`scripts/` alongside it. Each OAR job uses `oar-runs/$OAR_JOB_ID` for its experiment
+and `oar-runs/$OAR_JOB_ID/results` for the final tables and figures. Mining inputs
+and downloaded models are shared across jobs through `MINING_DIR` and
+`OLLAMA_MODELS_DIR`. Changing the package count requires a fresh run directory;
+an existing saved selection is never silently replaced. Optional pipeline flags,
+including `--skip-reranker-benchmarks`, are forwarded by the job wrapper.
+An error in the pipeline propagates to the OAR job, and its Ollama server is stopped.
+The wrapper keeps its Ollama server running through the pipeline; the standalone
+pipeline retains its own server lifecycle as described below.
 
 Ollama uses `127.0.0.1:11434`. If no server is running, the pipeline uses an installed
 `ollama` or `OLLAMA_BIN`; on Linux it can also download and extract the official
@@ -337,7 +365,7 @@ checksum. Prepare a dataset with the mining script for this two-image workflow.
 
 ```bash
 python3 -m unittest discover -s tests -v
-bash -n pipeline-mine-training-data.sh pipeline-benchmarks.sh
+bash -n job.oar.sh pipeline-mine-training-data.sh pipeline-benchmarks.sh
 ```
 
 The shell integration tests use stand-ins for downloads, Pharo and ML execution.

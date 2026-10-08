@@ -345,9 +345,9 @@ time.sleep(30)
         self.assertIn('Insufficient disk space', result.stderr)
         self.assertEqual((self.root / 'hf-requests').read_text().splitlines(), ['SHA256SUMS', 'snapshot.json'])
 
-    def test_exactly_two_shell_entry_points(self):
+    def test_pipeline_and_oar_shell_entry_points(self):
         self.assertEqual(sorted(p.name for p in ROOT.glob('*.sh')),
-                         ['pipeline-benchmarks.sh', 'pipeline-mine-training-data.sh'])
+                         ['job.oar.sh', 'pipeline-benchmarks.sh', 'pipeline-mine-training-data.sh'])
 
     def test_help_and_unknown_options_before_any_work(self):
         self.env.pop('BENCHMARK_JOBS')

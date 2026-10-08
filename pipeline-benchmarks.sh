@@ -160,6 +160,7 @@ sys.path.insert(0, sys.argv[1])
 from ranking_corpus import load_manifest
 load_manifest(Path(sys.argv[2]), image=Path(sys.argv[3]))
 PYCODE
+"${RERANKER_PYTHON:-python3}" "$SCRIPT_DIR/scripts/pharo_runtime.py" "$EXPERIMENT_DIR/image"
 touch "$EXPERIMENT_DIR/image-ready"
 cd "$EXPERIMENT_DIR/image"
 

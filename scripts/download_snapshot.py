@@ -16,6 +16,7 @@ from urllib.parse import quote
 import zipfile
 
 from ranking_corpus import load_split, read_json, sha256, verify
+from pharo_runtime import can_adapt, ensure_runtime
 
 
 DEFAULT_REPO = "pharo-llm/pharo-reranker-dataset"
@@ -120,7 +121,8 @@ def restore(mining, repo, revision):
             if snapshot["schema"] != "pharo-reranker-snapshot-v1":
                 raise ValueError("Unsupported snapshot schema")
             runtime = snapshot["runtime"]
-            if (runtime["os"], runtime["architecture"]) != (platform.system(), platform.machine()):
+            if ((runtime["os"], runtime["architecture"]) != (platform.system(), platform.machine())
+                    and not can_adapt(runtime)):
                 raise ValueError(f"Snapshot VM requires {runtime['os']} {runtime['architecture']}; "
                                  f"this host is {platform.system()} {platform.machine()}. "
                                  "Use a snapshot with a compatible VM, or prepare local mining data "
@@ -165,6 +167,7 @@ def restore(mining, repo, revision):
                 raise ValueError("Snapshot benchmark selection disagrees with package split")
             if not os.access(restored / "image/pharo", os.X_OK):
                 raise ValueError("Snapshot Pharo launcher is not executable")
+            ensure_runtime(restored / "image")
             (unpacked / "experiment").rename(restored / "snapshot-selection")
             (restored / "snapshot-origin.json").write_text(json.dumps({
                 "repo": repo, "revision": revision, "snapshotSHA256": sha256(snapshot_path)
