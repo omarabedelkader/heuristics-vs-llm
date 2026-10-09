@@ -140,14 +140,18 @@ def stop_processes(active):
     for process, *_ in active.values():
         try:
             os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # macOS reports EPERM instead of ESRCH for a group that already exited.
             pass
     deadline = time.monotonic() + 5
     for process, log, *_ in active.values():
         try:
             process.wait(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
             process.wait()
         log.close()
 
