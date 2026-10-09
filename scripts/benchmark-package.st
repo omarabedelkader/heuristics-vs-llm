@@ -51,7 +51,11 @@ rows := OrderedCollection new.
                     at: 'reciprocalRankSum' put: (count * (benchmark mmrForPrefixSize: prefix)) asFloat;
                     at: 'timeMs' put: (benchmark totalTimeForPrefix: prefix) asFloat;
                     at: 'memoryBytes' put: (benchmark totalMemoryForPrefix: prefix) asFloat;
-                    yourself) ] ] ] ].
+                    yourself).
+                "Hits: observations whose target is ranked within the first k (Top-k / Recall@k)."
+                #(1 2 3 10) do: [ :k |
+                    rows last at: 'top', k printString put:
+                        (count * (benchmark accuracyForCompletionIndex: (1 to: k) withPrefixSize: prefix)) rounded ] ] ] ] ].
 output := Dictionary new
     at: 'schema' put: 'coo-package-result-v1';
     at: 'package' put: packageName;

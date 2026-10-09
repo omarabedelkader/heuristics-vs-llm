@@ -496,20 +496,22 @@ log "Available models:"
 
 
 ###############################################################################
-# 8. Run normal benchmarks, then train and benchmark the re-ranker
+# 8. Run baseline, dependency, LLM and hybrid benchmarks
 ###############################################################################
 
 log "============================================================"
 log "8. RUNNING BENCHMARKS"
 log "============================================================"
 log "Benchmark packages: $BENCHMARK_PACKAGE_COUNT; concurrent package jobs: $BENCHMARK_JOBS"
-log "Seed: $RANKING_SEED; re-ranker epochs: $RANKING_EPOCHS"
+log "Seed: $RANKING_SEED"
 log "Experiment: $EXPERIMENT_DIR"
 
-# Run the same maintained pipeline used outside OAR. Its stages include dataset
-# restoration, normal benchmarks, training/validation/test, neural benchmarks,
-# and consolidated result publication. Ollama stays owned by this wrapper.
-# Deploy both pipeline scripts and scripts/ alongside job.oar.sh.
+# Run the same maintained pipeline used outside OAR: dataset restoration, the saved
+# benchmark packages, baseline/dependency/LLM/hybrid benchmarks and publication.
+# Ollama stays owned by this wrapper. The neural re-ranker needs no Ollama; submit
+# pipeline-reranker.sh separately with the same EXPERIMENT_DIR (RUN_DIR) so it uses
+# the same saved benchmark packages. Deploy the pipeline scripts and scripts/
+# alongside job.oar.sh.
 export OLLAMA_BIN OLLAMA_MODELS_DIR
 bash "$ROOT_DIR/pipeline-benchmarks.sh" "$@" &
 PIPELINE_PID=$!

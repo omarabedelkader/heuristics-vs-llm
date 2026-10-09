@@ -230,9 +230,67 @@ def partition(corpus, image, split_path, output, repository=None):
     return audit
 
 
+def import_selection(corpus, packages_path, output, seed=42):
+    """Save a user-supplied list of benchmark packages as the experiment's selection.
+
+    The file is a saved selection (coo-package-split-v1), a JSON array of package
+    names, or plain text with one package name per line (# starts a comment)."""
+    _, eligible = load_manifest(corpus)
+    text = packages_path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = [line.split("#", 1)[0].strip() for line in text.splitlines()]
+        data = [name for name in data if name]
+    if isinstance(data, dict):
+        if data.get("schema") != "coo-package-split-v1" or type(data.get("seed")) is not int:
+            raise ValueError(f"{packages_path}: not a saved benchmark selection")
+        benchmark, seed = data.get("benchmark"), data["seed"]
+    else:
+        benchmark = data
+    names = package_names(benchmark, str(packages_path))
+    unknown = sorted(names - eligible)
+    if unknown:
+        raise ValueError(f"{len(unknown)} listed packages are not benchmark-eligible in this image: "
+                         + ", ".join(unknown[:5]) + (" ..." if len(unknown) > 5 else ""))
+    if len(eligible - names) < 3:
+        raise ValueError("Leave at least three packages outside the benchmark list for train, validation and test")
+    selection = dict(schema="coo-package-split-v1", seed=seed, eligible=sorted(eligible),
+                     benchmark=sorted(names), train=sorted(eligible - names))
+    if output.exists():
+        if set(read_json(output).get("benchmark", [])) != names:
+            raise ValueError(f"{output} already saves a different benchmark package list; "
+                             "use a new EXPERIMENT_DIR or remove BENCHMARK_PACKAGES_FILE")
+        return read_json(output)
+    write_json(output, selection)
+    return selection
+
+
+def summarize(corpus, image, split_path, output, repository=None):
+    """Write only corpus.json, the split audit, from the manifest's package counts.
+
+    For runs without the neural re-ranker: no training, validation or test file is
+    written, and the large corpus is not read again."""
+    manifest, eligible = load_manifest(corpus, image, repository)
+    split = load_split(split_path, eligible)
+    output.mkdir(parents=True, exist_ok=True)
+    for name in ("training.jsonl", "validation.jsonl", "test.jsonl", "corpus.json"):
+        if (output / name).exists():
+            raise ValueError(f"Refusing to overwrite {output / name}; use a fresh run directory")
+    counts = manifest["rowsByPackage"]
+    row_counts = {key: sum(counts[name] for name in split.get(key, [])) for key in (*PARTITIONS, "unused")}
+    audit = dict(manifest, packageSplit=split, trainingRows=row_counts["train"],
+                 validationRows=row_counts["validation"], testRows=row_counts["test"],
+                 excludedBenchmarkRows=row_counts["benchmark"], excludedUnusedRows=row_counts["unused"],
+                 partitionSHA256=None)
+    write_json(output / "corpus.json", audit)
+    return audit
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("finalize", "verify", "partition", "split"))
+    parser.add_argument("action", choices=("finalize", "verify", "partition", "summarize", "split",
+                                           "import-selection"))
     parser.add_argument("corpus", type=Path)
     parser.add_argument("--image", type=Path, help="Mining image: required for finalize; optional provenance check otherwise")
     parser.add_argument("--repository", type=Path, help="Frozen source used by both independent images")
@@ -241,14 +299,23 @@ def main():
     parser.add_argument("--selection", type=Path)
     parser.add_argument("--ratios", default="80,10,10")
     parser.add_argument("--training-packages", type=int, help="Keep only this many training packages")
+    parser.add_argument("--packages", type=Path, help="import-selection: the benchmark package list")
+    parser.add_argument("--seed", type=int, default=42, help="import-selection: seed for a plain list")
     args = parser.parse_args()
     if args.action == "finalize" and args.image is None:
         parser.error("finalize requires --image")
-    if args.action == "partition" and (args.split is None or args.output is None):
-        parser.error("partition requires --split and --output")
+    if args.action in ("partition", "summarize") and (args.split is None or args.output is None):
+        parser.error(f"{args.action} requires --split and --output")
     if args.action == "split" and (args.selection is None or args.output is None):
         parser.error("split requires --selection and --output")
+    if args.action == "import-selection" and (args.packages is None or args.output is None):
+        parser.error("import-selection requires --packages and --output")
     try:
+        if args.action == "import-selection":
+            result = import_selection(args.corpus, args.packages, args.output, args.seed)
+            print(f"Benchmark packages: {len(result['benchmark'])} saved in {args.output}; "
+                  f"{len(result['train'])} other packages available for train/validation/test")
+            return 0
         if args.action == "split":
             result = create_split(args.corpus, args.selection, args.output,
                                   tuple(int(n) for n in args.ratios.split(",")), args.training_packages)
@@ -259,13 +326,17 @@ def main():
             result = finalize(args.corpus, args.image, args.repository)
         elif args.action == "verify":
             result = verify(args.corpus, args.image, args.split, args.repository)
+        elif args.action == "summarize":
+            result = summarize(args.corpus, args.image, args.split, args.output, args.repository)
         else:
             result = partition(args.corpus, args.image, args.split, args.output, args.repository)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"Corpus error: {error}", file=sys.stderr)
         return 1
     print(f"Corpus {args.action}: {result['rows']} rows across {len(result['eligible'])} packages")
-    if args.action == "partition":
+    if args.action in ("partition", "summarize"):
+        if args.action == "summarize":
+            print("No training/validation/test files written (re-ranker skipped)")
         print(f"Training: {result['trainingRows']}; validation: {result['validationRows']}; "
               f"test: {result['testRows']}; excluded benchmark rows: {result['excludedBenchmarkRows']}; "
               f"unused rows (TRAINING_PACKAGE_COUNT): {result['excludedUnusedRows']}")

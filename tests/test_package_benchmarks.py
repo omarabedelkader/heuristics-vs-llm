@@ -17,7 +17,8 @@ def result(package, phase, run_id, count=1, rank_sum=1, memory=-10):
     return dict(schema="coo-package-result-v1", package=package, phase=phase, runId=run_id,
                 corpus=dict(packages=1, classes=2, methods=3),
                 rows=[dict(kind=kind, strategy=strategy, prefix=prefix, count=count,
-                           reciprocalRankSum=rank_sum, timeMs=2 * count, memoryBytes=memory)
+                           reciprocalRankSum=rank_sum, timeMs=2 * count, memoryBytes=memory,
+                           **dict.fromkeys(workers.HITS, min(rank_sum, count)))
                       for kind, strategy, prefix in sorted(workers.row_keys(phase))])
 
 
@@ -65,6 +66,19 @@ class PackageWorkerTests(unittest.TestCase):
                 self.assertEqual(row["reciprocalRankSum"] / row["count"], 0.1)
                 self.assertEqual(row["timeMs"], 20)
                 self.assertEqual(row["memoryBytes"], -100)
+                self.assertEqual([row[field] for field in workers.HITS], [1, 1, 1, 1])
+
+    def test_top_k_hits_must_be_ordered_and_bounded_by_count(self):
+        self.checkpoints()
+        path = workers.package_directory(self.run, 1) / "normal.json"
+        for hits in ([1, 0, 0, 0], [0, 0, 0, 10], [0.5, 1, 1, 1]):
+            with self.subTest(hits=hits):
+                data = workers.read_json(path)
+                for row in data["rows"]:
+                    row.update(zip(workers.HITS, hits))
+                workers.atomic_json(path, data)
+                with self.assertRaisesRegex(ValueError, "top-k hit counts"):
+                    workers.validate_result(path, self.manifest["packages"][1], "normal", self.manifest["runId"])
 
     def test_missing_or_mismatched_results_block_aggregation(self):
         self.checkpoints()

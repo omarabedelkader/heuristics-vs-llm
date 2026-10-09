@@ -82,11 +82,11 @@ sys.exit(int(os.environ.get('TEST_PIPELINE_STATUS','0')))
         return result
 
     def test_original_model_downloads_and_new_pipeline_defaults(self):
-        self.run_job('--skip-reranker-benchmarks')
+        self.run_job('--skip-estimate')
         invocation = json.loads((self.root / 'invocation.json').read_text())
         self.assertEqual(invocation['env']['BENCHMARK_PACKAGE_COUNT'], '250')
         self.assertEqual(invocation['env']['BENCHMARK_JOBS'], '8')
-        self.assertEqual(invocation['args'], ['--skip-reranker-benchmarks'])
+        self.assertEqual(invocation['args'], ['--skip-estimate'])
         self.assertEqual(invocation['env']['RESULTS_DIR'], str(self.root / 'oar-runs/123/results'))
         self.assertIn('https://ollama.com/download/ollama-linux-', (self.root / 'ollama-download').read_text())
         self.assertEqual((self.root / 'pulls').read_text().splitlines(), [

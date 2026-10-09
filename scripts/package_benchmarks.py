@@ -21,7 +21,9 @@ STRATEGIES = {
                "llm3B", "llm7B", "hybrid05B", "hybrid15B", "hybrid3B", "hybrid7B"),
     "reranker": ("neuralRank10", "neuralRank20", "neuralRank30", "neuralRank50"),
 }
-TOTALS = ("count", "reciprocalRankSum", "timeMs", "memoryBytes")
+TOTALS = ("count", "reciprocalRankSum", "timeMs", "memoryBytes", "top1", "top2", "top3", "top10")
+# Observations whose target is ranked within the first k (Top-k accuracy, Recall@k).
+HITS = ("top1", "top2", "top3", "top10")
 
 
 def atomic_json(path, value):
@@ -46,8 +48,11 @@ def prepare(run, image):
         "split": sha256(run / "split.json"),
         "corpus": sha256(run / "corpus.json"),
         "image": sha256(image / "Pharo.image"),
-        "trainingConfig": sha256(run / "training-config.json"),
-        "partitions": {name: sha256(run / f"{name}.jsonl") for name in ("training", "validation", "test")},
+        # Only re-ranker runs train, so only they have a training configuration.
+        "trainingConfig": sha256(run / "training-config.json") if (run / "training-config.json").exists() else None,
+        # Runs without the re-ranker (training-config "reranker": false) have no partitions.
+        "partitions": {name: sha256(run / f"{name}.jsonl") if (run / f"{name}.jsonl").exists() else None
+                       for name in ("training", "validation", "test")},
         "scripts": {name: sha256(SCRIPTS / name) for name in (
             "package_benchmarks.py", "benchmark-package.st", "benchmark-export.st",
             "ranking_corpus.py", "reranker_workflow.py")},
@@ -114,6 +119,9 @@ def validate_result(path, package, phase, run_id):
             raise ValueError(f"Invalid reciprocal rank or time totals: {path}")
         if row["count"] == 0 and any(row[field] != 0 for field in TOTALS[1:]):
             raise ValueError(f"Totals without observations: {path}")
+        hits = [row[field] for field in HITS]
+        if any(type(n) is not int for n in hits) or not 0 <= hits[0] <= hits[1] <= hits[2] <= hits[3] <= row["count"]:
+            raise ValueError(f"Invalid top-k hit counts: {path}")
     if seen != row_keys(phase):
         raise ValueError(f"Incomplete measurements: {path}")
     return result
@@ -243,13 +251,11 @@ def run_workers(run, image, phase, jobs):
     execute(pending, jobs, phase, start, finish)
 
 
-def calibrate(run, image, phase, jobs):
-    """Time real workers on small TRAINING packages at the chosen concurrency.
-
-    Benchmark packages are never touched; results are discarded after timing."""
+def prepare_calibration(run, jobs):
+    """Choose the small TRAINING packages that calibration times, once per concurrency."""
     directory = run / "calibration"
     info_path = directory / "info.json"
-    if phase == "normal" and not (info_path.exists() and read_json(info_path)["jobs"] == jobs):
+    if not (info_path.exists() and read_json(info_path)["jobs"] == jobs):
         shutil.rmtree(directory, ignore_errors=True)
         directory.mkdir()
         split = load_split(run / "split.json")
@@ -266,7 +272,15 @@ def calibrate(run, image, phase, jobs):
         atomic_json(directory / "split.json", calibration_split)
         atomic_json(info_path, dict(jobs=jobs, runId=uuid.uuid4().hex, packages=chosen,
                                     rows={name: rows[name] for name in chosen}))
-    info = read_json(info_path)
+    return read_json(info_path)
+
+
+def calibrate(run, image, phase, jobs):
+    """Time real workers on small TRAINING packages at the chosen concurrency.
+
+    Benchmark packages are never touched; results are discarded after timing."""
+    directory = run / "calibration"
+    info = prepare_calibration(run, jobs)
     if info["jobs"] != jobs:
         raise ValueError("Calibration concurrency differs; recalibrate the normal phase first")
     output = directory / f"{phase}.json"
@@ -294,10 +308,11 @@ def calibrate(run, image, phase, jobs):
     return result
 
 
-def aggregate(run, image, normal_only=False):
+def aggregate(run, image, normal_only=False, phases=None):
     manifest = prepare(run, image)
-    phases = ("normal",) if normal_only else tuple(STRATEGIES)
-    if not normal_only:
+    if phases is None:
+        phases = ("normal",) if normal_only else tuple(STRATEGIES)
+    if "reranker" in phases:
         pin_model(run)
     combined = dict(packages=manifest["packages"], benchmarkPhases=list(phases),
                     corpus=dict(packages=0, classes=0, methods=0))
@@ -306,7 +321,7 @@ def aggregate(run, image, normal_only=False):
         results = {phase: validate_result(package_directory(run, index) / f"{phase}.json",
                                          package, phase, manifest["runId"])
                    for phase in phases}
-        corpus = results["normal"]["corpus"]
+        corpus = results[phases[0]]["corpus"]
         if "reranker" in results and corpus != results["reranker"]["corpus"]:
             raise ValueError(f"Normal and re-ranker corpus counts differ for {package}")
         for key, value in corpus.items():
@@ -331,7 +346,8 @@ def interrupted(signum, _frame):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "pin-model", "run", "calibrate", "aggregate"))
+    parser.add_argument("action", choices=("prepare", "pin-model", "run", "prepare-calibration",
+                                           "calibrate", "aggregate"))
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--phase", choices=tuple(STRATEGIES))
@@ -342,6 +358,8 @@ def main():
         parser.error(f"{args.action} requires --phase and --jobs (no automatic concurrency)")
     if args.normal_only and args.action != "aggregate":
         parser.error("--normal-only applies only to aggregate")
+    if args.action == "prepare-calibration" and args.jobs is None:
+        parser.error("prepare-calibration requires --jobs")
     signal.signal(signal.SIGTERM, interrupted)
     try:
         if args.action == "prepare":
@@ -351,10 +369,14 @@ def main():
             pin_model(args.run.resolve())
         elif args.action == "run":
             run_workers(args.run.resolve(), args.image.resolve(), args.phase, args.jobs)
+        elif args.action == "prepare-calibration":
+            prepare_calibration(args.run.resolve(), args.jobs)
         elif args.action == "calibrate":
             calibrate(args.run.resolve(), args.image.resolve(), args.phase, args.jobs)
         else:
-            print(aggregate(args.run.resolve(), args.image.resolve(), args.normal_only))
+            # --phase aggregates that phase alone (separate normal and re-ranker pipelines).
+            phases = (args.phase,) if args.phase else None
+            print(aggregate(args.run.resolve(), args.image.resolve(), args.normal_only, phases))
     except KeyboardInterrupt:
         return 130
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:

@@ -103,7 +103,7 @@ elif 'coo-package-result-v1' in code:
     if phase == 'reranker' and os.environ.get('TEST_FAIL_RERANKER'):
         sys.exit(24)
     rows = [dict(kind=kind, strategy=strategy, prefix=prefix, count=2,
-                 reciprocalRankSum=1.0, timeMs=4.0, memoryBytes=-2.0)
+                 reciprocalRankSum=1.0, timeMs=4.0, memoryBytes=-2.0, top1=1, top2=1, top3=1, top10=1)
             for kind in ('messages', 'variables') for strategy in STRATEGIES[phase]
             for prefix in range(2, 9)]
     Path(os.environ['BENCHMARK_OUTPUT']).write_text(json.dumps(dict(
@@ -113,11 +113,15 @@ elif 'CooPipelineStatistics' in code:
     data = json.loads(Path(os.environ['BENCHMARK_AGGREGATE']).read_text())
     assert data['corpus'] == dict(packages=1, classes=2, methods=3)
     publication = Path(os.environ['PUBLICATION_DIR'])
-    (publication / 'results-table.tex').write_text('Baseline Dependency LLM 05 15 3 7 Hybrid 05 15 3 7')
-    (publication / 'performance.png').write_bytes(b'normal performance image')
-    (publication / 'dataset-summary.tex').write_text('Packages: 1 Classes: 2 Methods: 3')
+    assert list(data['benchmarkPhases']) == [phase for phase in ('normal', 'reranker') if phase in data]
+    if 'normal' in data:
+        (publication / 'results-table.tex').write_text('Baseline Dependency LLM 05 15 3 7 Hybrid 05 15 3 7')
+        (publication / 'performance.png').write_bytes(b'normal performance image')
+        (publication / 'dataset-summary.tex').write_text('Packages: 1 Classes: 2 Methods: 3')
+        (publication / 'recall-top.tex').write_text('Top-1 Top-2 Top-3 Recall@10')
     if 'reranker' in data:
         (publication / 'results-table-re-ranker.tex').write_text('NeuralRank 10 20 30 50')
+        (publication / 'recall-top-re-ranker.tex').write_text('NeuralRank Top-1 Top-2 Top-3 Recall@10')
         if not os.environ.get('TEST_MISSING_FIGURE'):
             (publication / 'performance-re-ranker.png').write_bytes(b'reranker performance image')
     (root / 'benchmark-complete').touch()
@@ -131,6 +135,8 @@ from pathlib import Path
 args = sys.argv[1:]
 root = Path(os.environ['TEST_ROOT'])
 if args[:2] == ['-m', 'pip']:
+    with (root / 'pip-calls').open('a') as out:
+        out.write('pip\\n')
     sys.exit(0)
 if Path(args[0]).name == 'reranker_workflow.py':
     action = args[1]
@@ -141,8 +147,8 @@ if Path(args[0]).name == 'reranker_workflow.py':
             rows = [json.loads(line) for line in Path(args[args.index(option) + 1]).read_text().splitlines()]
             assert {row['group'] for row in rows} == set(split[key])
             assert not ({row['group'] for row in rows} & set(split['benchmark'] + split['test']))
-        run = Path(os.environ['RERANKER_RUN_DIR'])
-        assert (run / 'packages/0001/normal.json').exists(), 'Normal benchmarks must precede training'
+        run = Path(os.environ['RUN_DIR'])
+        assert run.name.startswith('reranker-run.'), 'Only the re-ranker pipeline trains'
         if os.environ.get('TEST_FAIL_TRAINING'):
             sys.exit(25)
         model = Path(args[args.index('--output') + 1])
@@ -161,7 +167,7 @@ if Path(args[0]).name == 'reranker_workflow.py':
         assert not ({row['group'] for row in rows} & set(split['benchmark']))
         Path(args[args.index('--output') + 1]).write_text('{}')
     elif action == 'calibrate':
-        assert not (Path(os.environ['RERANKER_RUN_DIR']) / 'packages').exists(), 'Calibration precedes benchmarks'
+        assert not (Path(os.environ['RUN_DIR']) / 'packages').exists(), 'Calibration precedes benchmarks'
         model = Path(args[args.index('--output') + 1])
         model.mkdir()
         (model / 'ranker.onnx').write_bytes(b'untrained')
@@ -210,7 +216,7 @@ time.sleep(30)
 
     def run_script(self, name, expected=0, args=(), estimate=False):
         # The runtime estimate has dedicated tests; elsewhere it would only add calls.
-        if name == 'pipeline-benchmarks.sh' and not estimate:
+        if name in ('pipeline-benchmarks.sh', 'pipeline-reranker.sh') and not estimate and '--help' not in args:
             args = ['--skip-estimate', *args]
         result = subprocess.run(["bash", str(ROOT / name), *args], env=self.env,
                                 capture_output=True, text=True, timeout=15)
@@ -278,7 +284,8 @@ time.sleep(30)
         result = self.run_script('pipeline-benchmarks.sh')
         self.assertIn('Restored verified snapshot', result.stdout)
         self.assertIn("snapshot's saved benchmark selection", result.stdout)
-        self.assertEqual(json.loads((self.experiment / 'split.json').read_text())['benchmark'], ['Package-A'])
+        run = next(self.experiment.glob('benchmark-run.*'))
+        self.assertEqual(json.loads((run / 'split.json').read_text())['benchmark'], ['Package-A'])
         calls = (self.root / 'pharo-calls.jsonl').read_text()
         self.assertNotIn('Metacello new', calls)
         self.assertNotIn('exportRankingCorpusForPackages:', calls)
@@ -374,42 +381,102 @@ time.sleep(30)
 
     def test_pipeline_and_oar_shell_entry_points(self):
         self.assertEqual(sorted(p.name for p in ROOT.glob('*.sh')),
-                         ['job.oar.sh', 'pipeline-benchmarks.sh', 'pipeline-mine-training-data.sh'])
+                         ['job.oar.sh', 'pipeline-benchmarks.sh', 'pipeline-mine-training-data.sh',
+                          'pipeline-reranker.sh'])
 
     def test_help_and_unknown_options_before_any_work(self):
         self.env.pop('BENCHMARK_JOBS')
         result = self.run_script('pipeline-benchmarks.sh', args=['--help'])
-        self.assertIn('--skip-reranker-benchmarks', result.stdout)
-        result = self.run_script('pipeline-benchmarks.sh', 2, args=['--unknown'])
-        self.assertIn('Unknown option', result.stderr)
+        self.assertIn('pipeline-reranker.sh', result.stdout)
+        self.assertIn('BENCHMARK_PACKAGES_FILE', result.stdout)
+        result = self.run_script('pipeline-reranker.sh', args=['--help'])
+        self.assertIn('RANKING_EPOCHS', result.stdout)
+        for script in ('pipeline-benchmarks.sh', 'pipeline-reranker.sh'):
+            result = self.run_script(script, 2, args=['--skip-reranker'])
+            self.assertIn('Unknown option', result.stderr)
         self.assertFalse((self.root / 'downloads').exists())
 
-    def test_skip_reranker_benchmarks_keeps_training_and_removes_stale_neural_outputs(self):
+    def results(self):
+        return {p.name for p in (self.root / 'resutls').iterdir()}
+
+    def test_benchmarks_pipeline_runs_only_baseline_dependency_llm_and_hybrid(self):
         self.run_script('pipeline-benchmarks.sh')
-        runs = set(self.experiment.glob('reranker-run.*'))
-        self.env['TEST_FAIL_RERANKER'] = '1'
-        result = self.run_script('pipeline-benchmarks.sh', args=['--skip-reranker-benchmarks'])
-        self.assertIn('Skipping live neural', result.stdout)
-        run = (set(self.experiment.glob('reranker-run.*')) - runs).pop()
-        self.assertTrue((run / 'training-ready').exists())
+        run = next(self.experiment.glob('benchmark-run.*'))
+        self.assertEqual(list(self.experiment.glob('reranker-run.*')), [])
+        for name in ('training.jsonl', 'validation.jsonl', 'test.jsonl', 'training-config.json',
+                     'model', 'learning', 'packages/0001/reranker.json'):
+            self.assertFalse((run / name).exists(), name)
+        self.assertTrue((run / 'packages/0001/normal.json').exists())
+        timings = [json.loads(line) for line in (run / 'timings.jsonl').read_text().splitlines()]
+        self.assertEqual([t['phase'] for t in timings], ['normal'])
+        for calls in ('training-calls', 'pip-calls', 'reranker-server-calls'):
+            self.assertFalse((self.root / calls).exists(), calls)
+        self.assertEqual(self.results(), {'results-table.tex', 'performance.png', 'dataset-summary.tex', 'recall-top.tex'})
+
+    def test_reranker_pipeline_alone_trains_validates_tests_and_benchmarks(self):
+        self.env['TEST_START_OLLAMA'] = '1'
+        result = self.run_script('pipeline-reranker.sh')
+        self.assertIn('benchmark packages excluded from ALL three', result.stdout)
+        self.assertEqual(list(self.experiment.glob('benchmark-run.*')), [])
+        run = next(self.experiment.glob('reranker-run.*'))
+        split = json.loads((run / 'split.json').read_text())
+        selection = json.loads((self.experiment / 'benchmark-selection.json').read_text())
+        self.assertEqual(split['benchmark'], selection['benchmark'])
+        for name, key in (('training', 'train'), ('validation', 'validation'), ('test', 'test')):
+            groups = {json.loads(line)['group'] for line in (run / f'{name}.jsonl').read_text().splitlines()}
+            self.assertEqual(groups, set(split[key]))
+            self.assertFalse(groups & set(split['benchmark']))
+        self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['train'])
         self.assertTrue((run / 'evaluation.json').is_file())
         self.assertEqual(len(list((run / 'learning').glob('*.png'))), 3)
-        self.assertFalse((run / 'packages/0001/reranker.json').exists())
-        self.assertEqual((self.root / 'reranker-server-calls').read_text().splitlines(), ['serve'])
-        self.assertEqual({p.name for p in (self.root / 'resutls').iterdir()},
-                         {'results-table.tex', 'performance.png', 'dataset-summary.tex'})
-
-    def test_resume_without_skip_flag_adds_neural_benchmarks_without_retraining(self):
-        self.run_script('pipeline-benchmarks.sh', args=['--skip-reranker-benchmarks'])
-        run = next(self.experiment.glob('reranker-run.*'))
-        saved = (run / 'packages/0001/normal.json').read_bytes()
-        self.assertFalse((self.root / 'reranker-server-calls').exists())
-        self.env['BENCHMARK_RESUME_DIR'] = str(run)
-        self.run_script('pipeline-benchmarks.sh')
-        self.assertEqual((run / 'packages/0001/normal.json').read_bytes(), saved)
-        self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['train'])
         self.assertTrue((run / 'packages/0001/reranker.json').exists())
-        self.assertEqual(len(list((self.root / 'resutls').iterdir())), 5)
+        self.assertFalse((run / 'packages/0001/normal.json').exists())
+        self.assertFalse((self.root / 'ollama-pid').exists(), 'The re-ranker pipeline needs no Ollama')
+        self.assertEqual(self.results(), {'results-table-re-ranker.tex', 'performance-reranker.png', 'recall-top-re-ranker.tex'})
+
+    def test_both_pipelines_benchmark_the_same_saved_packages(self):
+        self.run_script('pipeline-benchmarks.sh')
+        selection = (self.experiment / 'benchmark-selection.json').read_bytes()
+        self.run_script('pipeline-reranker.sh')
+        self.assertEqual((self.experiment / 'benchmark-selection.json').read_bytes(), selection)
+        normal = json.loads(next(self.experiment.glob('benchmark-run.*/split.json')).read_text())
+        reranker = json.loads(next(self.experiment.glob('reranker-run.*/split.json')).read_text())
+        self.assertEqual(normal['benchmark'], reranker['benchmark'])
+        self.assertEqual(self.results(), {'results-table.tex', 'performance.png', 'dataset-summary.tex',
+                                          'recall-top.tex', 'results-table-re-ranker.tex',
+                                          'performance-reranker.png', 'recall-top-re-ranker.tex'})
+        calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
+        selected = [c for c in calls if 'benchmarkPackages:' in c['code']]
+        self.assertEqual(len(selected), 2, 'Each pipeline checks the one saved selection')
+
+    def test_user_package_list_is_saved_and_kept_out_of_training(self):
+        self.env.pop('BENCHMARK_PACKAGE_COUNT')
+        packages = self.root / 'my packages.txt'
+        packages.write_text('# packages to benchmark\n\nPackage-C  # the one to hold out\n')
+        self.env['BENCHMARK_PACKAGES_FILE'] = str(packages)
+        self.run_script('pipeline-reranker.sh')
+        selection = json.loads((self.experiment / 'benchmark-selection.json').read_text())
+        self.assertEqual(selection['benchmark'], ['Package-C'])
+        run = next(self.experiment.glob('reranker-run.*'))
+        split = json.loads((run / 'split.json').read_text())
+        self.assertEqual(split['benchmark'], ['Package-C'])
+        groups = {json.loads(line)['group'] for name in ('training', 'validation', 'test')
+                  for line in (run / f'{name}.jsonl').read_text().splitlines()}
+        self.assertNotIn('Package-C', groups)
+        self.assertEqual(len(list(run.glob('packages/*/reranker.json'))), 1)
+        # The saved list is reused without the file, and a different list is refused.
+        self.env.pop('BENCHMARK_PACKAGES_FILE')
+        self.run_script('pipeline-benchmarks.sh')
+        normal = json.loads(next(self.experiment.glob('benchmark-run.*/split.json')).read_text())
+        self.assertEqual(normal['benchmark'], ['Package-C'])
+        packages.write_text('["Package-D"]')
+        self.env['BENCHMARK_PACKAGES_FILE'] = str(packages)
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn('different benchmark package list', result.stderr)
+        packages.write_text('Not-A-Package\n')
+        self.env['EXPERIMENT_DIR'] = str(self.root / 'other-experiment')
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn('not benchmark-eligible', result.stderr)
 
     def test_job_count_must_be_explicit_and_positive(self):
         for value in ('', '0', '-1', 'auto', '2.5'):
@@ -418,47 +485,54 @@ time.sleep(30)
             self.assertIn('BENCHMARK_JOBS', result.stderr)
             self.assertFalse((self.root / 'downloads').exists())
 
-    def test_estimate_only_times_training_packages_then_resume_reuses_calibration(self):
+    def test_benchmarks_estimate_times_only_normal_benchmarks(self):
         self.run_script('pipeline-mine-training-data.sh')
         result = self.run_script('pipeline-benchmarks.sh', args=['--estimate-only'], estimate=True)
         self.assertIn('RUNTIME ESTIMATE for this machine with BENCHMARK_JOBS=2', result.stdout)
-        self.assertIn('RENT AT LEAST', result.stdout)
-        self.assertIn('re-ranker training', result.stdout)
         self.assertIn('Estimate only: no benchmark package was run', result.stdout)
+        run = next(self.experiment.glob('benchmark-run.*'))
+        estimate = json.loads((run / 'estimate.json').read_text())
+        self.assertEqual([s['stage'] for s in estimate['stages']], ['normal benchmarks'])
+        self.assertFalse((self.root / 'training-calls').exists())
+        self.assertFalse((run / 'packages').exists())
+
+    def test_reranker_estimate_times_training_then_resume_reuses_calibration(self):
+        self.run_script('pipeline-mine-training-data.sh')
+        result = self.run_script('pipeline-reranker.sh', args=['--estimate-only'], estimate=True)
+        self.assertIn('RUNTIME ESTIMATE for this machine with BENCHMARK_JOBS=2', result.stdout)
+        self.assertIn('RENT AT LEAST', result.stdout)
+        self.assertIn('Estimate only: nothing was trained or benchmarked', result.stdout)
         run = next(self.experiment.glob('reranker-run.*'))
         split = json.loads((run / 'split.json').read_text())
         info = json.loads((run / 'calibration/info.json').read_text())
         self.assertEqual(len(info['packages']), 2)
         self.assertLessEqual(set(info['packages']), set(split['train']))
         self.assertFalse((run / 'packages').exists())
-        self.assertFalse((self.root / 'benchmark-complete').exists())
         self.assertEqual(list((run / 'calibration/packages').glob('*/image')), [])
         estimate = json.loads((run / 'estimate.json').read_text())
         self.assertEqual([s['stage'] for s in estimate['stages']], [
-            'normal benchmarks', 're-ranker training', 'test evaluation', 'reranker benchmarks'])
+            're-ranker training', 'test evaluation', 'reranker benchmarks'])
         self.assertGreater(estimate['recommendedSeconds'], estimate['totalSeconds'])
         calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
         timed = [c for c in calls if 'coo-package-result-v1' in c['code']]
-        self.assertEqual(len(timed), 4)
+        self.assertEqual(len(timed), 2)
         self.assertTrue(all('/calibration/packages/' in c['cwd'] for c in timed))
         self.assertEqual((self.root / 'reranker-server-calls').read_text().splitlines(), ['serve'])
 
         self.env['BENCHMARK_RESUME_DIR'] = str(run)
-        result = self.run_script('pipeline-benchmarks.sh', estimate=True)
-        self.assertIn('Reusing saved timings', result.stdout)
-        self.assertLess(result.stdout.index('RUNTIME ESTIMATE'), result.stdout.index('Running baseline'))
-        self.assertIn('Predicted total:', result.stdout)
-        self.assertTrue((self.root / 'benchmark-complete').exists())
-        self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['calibrate', 'train'])
+        result = self.run_script('pipeline-reranker.sh', estimate=True)
+        self.assertLess(result.stdout.index('RUNTIME ESTIMATE'), result.stdout.index('Training re-ranker'))
         calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
-        self.assertEqual(sum('/calibration/packages/' in c['cwd'] for c in calls), 4)
+        self.assertEqual(sum('/calibration/packages/' in c['cwd'] for c in calls), 2, 'Saved timings are reused')
+        self.assertIn('Predicted total:', result.stdout)
+        self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['calibrate', 'train'])
         timings = [json.loads(line) for line in (run / 'timings.jsonl').read_text().splitlines()]
-        self.assertEqual([t['phase'] for t in timings], ['normal', 'reranker'])
+        self.assertEqual([t['phase'] for t in timings], ['reranker'])
 
     def test_training_package_count_limits_training_and_is_pinned(self):
         self.run_script('pipeline-mine-training-data.sh')
         self.env['TRAINING_PACKAGE_COUNT'] = '1'
-        result = self.run_script('pipeline-benchmarks.sh', estimate=True)
+        result = self.run_script('pipeline-reranker.sh', estimate=True)
         self.assertIn('unused=2', result.stdout)
         self.assertIn('RUNTIME ESTIMATE', result.stdout)
         self.assertTrue((self.root / 'benchmark-complete').exists())
@@ -468,50 +542,47 @@ time.sleep(30)
         self.assertEqual(split['trainingPackageCount'], 1)
         groups = {json.loads(line)['group'] for line in (run / 'training.jsonl').read_text().splitlines()}
         self.assertEqual(groups, set(split['train']))
-        self.env['TRAINING_PACKAGE_COUNT'] = '2'
-        result = self.run_script('pipeline-benchmarks.sh', 1)
-        self.assertIn('TRAINING_PACKAGE_COUNT', result.stderr)
+        # Each run derives its own split; it cannot keep more packages than training has.
+        self.env['TRAINING_PACKAGE_COUNT'] = '4'
+        result = self.run_script('pipeline-reranker.sh', 1)
+        self.assertIn('TRAINING_PACKAGE_COUNT must be between 1 and 3', result.stderr)
         self.env['TRAINING_PACKAGE_COUNT'] = 'many'
-        result = self.run_script('pipeline-benchmarks.sh', 1)
+        result = self.run_script('pipeline-reranker.sh', 1)
         self.assertIn('TRAINING_PACKAGE_COUNT must be a positive integer', result.stderr)
-
-    def test_estimate_respects_skip_reranker_benchmarks(self):
-        self.run_script('pipeline-mine-training-data.sh')
-        self.run_script('pipeline-benchmarks.sh', args=['--estimate-only', '--skip-reranker-benchmarks'],
-                        estimate=True)
-        run = next(self.experiment.glob('reranker-run.*'))
-        estimate = json.loads((run / 'estimate.json').read_text())
-        self.assertNotIn('reranker benchmarks', [s['stage'] for s in estimate['stages']])
-        self.assertFalse((self.root / 'reranker-server-calls').exists())
-        self.assertFalse((run / 'calibration/reranker.json').exists())
 
     def test_resume_uses_same_model_and_completed_package_results(self):
         self.run_script('pipeline-mine-training-data.sh')
         self.env['TEST_FAIL_RERANKER'] = '1'
-        self.run_script('pipeline-benchmarks.sh', 1)
+        self.run_script('pipeline-reranker.sh', 1)
         run = next(self.experiment.glob('reranker-run.*'))
-        saved = (run / 'packages/0001/normal.json').read_bytes()
+        model = (run / 'model-inputs.json').read_bytes()
         self.env.pop('TEST_FAIL_RERANKER')
         self.env['BENCHMARK_RESUME_DIR'] = str(run)
         self.env['BENCHMARK_JOBS'] = '1'
-        self.run_script('pipeline-benchmarks.sh')
-        self.assertEqual((run / 'packages/0001/normal.json').read_bytes(), saved)
+        self.run_script('pipeline-reranker.sh')
+        self.assertEqual((run / 'model-inputs.json').read_bytes(), model)
         self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['train'])
-        calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
-        self.assertEqual(sum('coo-package-result-v1' in c['code'] for c in calls), 3)
+        self.assertTrue((run / 'packages/0001/reranker.json').exists())
 
-    def test_training_failure_preserves_normal_checkpoints_for_resume(self):
+    def test_resume_directory_must_belong_to_the_same_pipeline(self):
+        self.run_script('pipeline-benchmarks.sh')
+        self.env['BENCHMARK_RESUME_DIR'] = str(next(self.experiment.glob('benchmark-run.*')))
+        result = self.run_script('pipeline-reranker.sh', 1)
+        self.assertIn('reranker-run.* directory', result.stderr)
+        self.assertFalse((self.root / 'training-calls').exists())
+
+    def test_training_failure_is_resumed_without_repartitioning(self):
         self.run_script('pipeline-mine-training-data.sh')
         self.env['TEST_FAIL_TRAINING'] = '1'
-        self.run_script('pipeline-benchmarks.sh', 1)
+        self.run_script('pipeline-reranker.sh', 1)
         run = next(self.experiment.glob('reranker-run.*'))
-        saved = (run / 'packages/0001/normal.json').read_bytes()
+        training = (run / 'training.jsonl').read_bytes()
         self.assertFalse((run / 'training-ready').exists())
         self.assertFalse((run / 'model-inputs.json').exists())
         self.env.pop('TEST_FAIL_TRAINING')
         self.env['BENCHMARK_RESUME_DIR'] = str(run)
-        self.run_script('pipeline-benchmarks.sh')
-        self.assertEqual((run / 'packages/0001/normal.json').read_bytes(), saved)
+        self.run_script('pipeline-reranker.sh')
+        self.assertEqual((run / 'training.jsonl').read_bytes(), training)
         self.assertEqual((self.root / 'training-calls').read_text().splitlines(), ['train'])
         self.assertEqual(len(list((run / 'learning').glob('*.png'))), 3)
         self.assertEqual(len(list((run / 'learning').glob('*.pdf'))), 3)
@@ -577,9 +648,9 @@ time.sleep(30)
         shutil.rmtree(self.mining / 'image')
         self.run_script('pipeline-mine-training-data.sh')
         self.assertEqual((self.root / 'pharo-calls.jsonl').read_bytes(), calls_before)
-        split = (self.experiment / 'split.json').read_bytes()
-        self.run_script('pipeline-benchmarks.sh')
-        self.assertEqual((self.experiment / 'split.json').read_bytes(), split)
+        selection = (self.experiment / 'benchmark-selection.json').read_bytes()
+        self.run_script('pipeline-reranker.sh')
+        self.assertEqual((self.experiment / 'benchmark-selection.json').read_bytes(), selection)
         self.assertEqual((self.root / 'downloads').read_text().splitlines(),
                          [str(self.mining / 'image')])
         calls = [json.loads(line) for line in (self.root / 'pharo-calls.jsonl').read_text().splitlines()]
@@ -594,12 +665,13 @@ time.sleep(30)
             self.assertNotIn('exportTestForSplit:', call['code'])
         self.assertTrue((self.root / 'benchmark-complete').exists())
         self.assertFalse((self.root / 'ollama-pid').exists(), 'Existing server must not be restarted')
-        expected = {'results-table.tex', 'results-table-re-ranker.tex',
-                    'performance.png', 'performance-reranker.png', 'dataset-summary.tex'}
+        expected = {'results-table.tex', 'results-table-re-ranker.tex', 'recall-top.tex',
+                    'recall-top-re-ranker.tex', 'performance.png', 'performance-reranker.png',
+                    'dataset-summary.tex'}
         self.assertEqual({p.name for p in (self.root / 'resutls').iterdir()}, expected)
         self.assertEqual((self.root / 'resutls/dataset-summary.tex').read_text(),
                          'Packages: 1 Classes: 2 Methods: 3')
-        self.assertEqual(sum('coo-package-result-v1' in c['code'] for c in calls), 4)
+        self.assertEqual(sum('coo-package-result-v1' in c['code'] for c in calls), 2)
         self.assertEqual(sum('CooPipelineStatistics' in c['code'] for c in calls), 2)
 
     def test_new_experiment_requires_original_mining_image(self):
@@ -640,18 +712,19 @@ time.sleep(30)
         results.mkdir()
         legacy = results / 'performance-re-ranker.png'
         legacy.write_bytes(b'old figure')
-        self.run_script('pipeline-benchmarks.sh')
+        self.run_script('pipeline-reranker.sh')
         self.assertFalse(legacy.exists())
         self.assertTrue((results / 'performance-reranker.png').is_file())
 
     def test_failed_run_does_not_publish_partial_or_stale_outputs(self):
         self.run_script('pipeline-mine-training-data.sh')
         self.run_script('pipeline-benchmarks.sh')
+        self.run_script('pipeline-reranker.sh')
         saved = {p.name: p.read_bytes() for p in (self.root / 'resutls').iterdir()}
         for flag, status in [('TEST_FAIL_RERANKER', 1), ('TEST_MISSING_FIGURE', 1)]:
             with self.subTest(flag=flag):
                 self.env[flag] = '1'
-                self.run_script('pipeline-benchmarks.sh', status)
+                self.run_script('pipeline-reranker.sh', status)
                 self.env.pop(flag)
                 self.assertEqual({p.name: p.read_bytes() for p in (self.root / 'resutls').iterdir()}, saved)
 
@@ -664,7 +737,7 @@ time.sleep(30)
     def test_different_package_pool_rejected_before_training(self):
         self.run_script('pipeline-mine-training-data.sh')
         self.env['TEST_DIFFERENT_POOL'] = '1'
-        result = self.run_script('pipeline-benchmarks.sh', 1)
+        result = self.run_script('pipeline-reranker.sh', 1)
         self.assertIn('different package pools', result.stderr)
         self.assertFalse((self.root / 'trainer-checked').exists())
 

@@ -61,13 +61,16 @@ def duration(seconds):
     return f"{minutes // 60}h{minutes % 60:02d}m"
 
 
-def estimate(run, jobs, elapsed, normal_only=False):
+def estimate(run, jobs, elapsed, normal_only=False, training=True, reranker_only=False):
     workers = read_json(run / "workers.json")
     rows = read_json(run / "corpus.json")["rowsByPackage"]
     calibration = run / "calibration"
     stages = []
     largest = max(workers["packages"], key=lambda name: rows[name])
-    for phase in ("normal",) if normal_only else ("normal", "reranker"):
+    phases = ("normal",) if normal_only else ("reranker",) if reranker_only else ("normal", "reranker")
+    for position, phase in enumerate(phases):
+        if phase == "reranker" and reranker_only:
+            add_training(run, calibration, stages, training)
         measured = read_json(calibration / f"{phase}.json")
         if measured["jobs"] != jobs:
             raise ValueError(f"Calibration used {measured['jobs']} jobs, not {jobs}; recalibrate")
@@ -79,15 +82,11 @@ def estimate(run, jobs, elapsed, normal_only=False):
         stages.append(dict(stage=f"{phase} benchmarks", seconds=seconds,
                            detail=f"{len(pending)} packages, {examples:,} examples, "
                                   f"{per_example:.2f} s/example + {startup:.0f} s startup per package"))
-        if phase == "normal":
+        if position == 0:
             stages[-1]["largestPackage"] = dict(name=largest, rows=rows[largest],
                                                 seconds=startup + per_example * rows[largest])
-            if not (run / "training-ready").exists():
-                training = read_json(calibration / "training.json")
-                stages.append(dict(stage="re-ranker training", seconds=training["trainingSeconds"],
-                                   detail=training["trainingDetail"]))
-                stages.append(dict(stage="test evaluation", seconds=training["evaluationSeconds"],
-                                   detail=training["evaluationDetail"]))
+        if phase == "normal":
+            add_training(run, calibration, stages, training)
     remaining = sum(stage["seconds"] for stage in stages)
     total = elapsed + remaining
     result = dict(schema="coo-runtime-estimate-v1", jobs=jobs, elapsedSeconds=elapsed,
@@ -95,6 +94,15 @@ def estimate(run, jobs, elapsed, normal_only=False):
                   recommendedSeconds=total * MARGIN)
     write_json(run / "estimate.json", result)
     return result
+
+
+def add_training(run, calibration, stages, training):
+    if training and not (run / "training-ready").exists():
+        measured = read_json(calibration / "training.json")
+        stages.append(dict(stage="re-ranker training", seconds=measured["trainingSeconds"],
+                           detail=measured["trainingDetail"]))
+        stages.append(dict(stage="test evaluation", seconds=measured["evaluationSeconds"],
+                           detail=measured["evaluationDetail"]))
 
 
 def report(result):
@@ -123,9 +131,13 @@ def main():
     parser.add_argument("--jobs", type=int, required=True)
     parser.add_argument("--elapsed", type=float, default=0.0, help="Seconds already spent in this invocation")
     parser.add_argument("--normal-only", action="store_true")
+    parser.add_argument("--no-training", action="store_true", help="The run skips re-ranker training")
+    parser.add_argument("--reranker-only", action="store_true",
+                        help="Training, test evaluation and re-ranker benchmarks only")
     args = parser.parse_args()
     try:
-        print(report(estimate(args.run.resolve(), args.jobs, args.elapsed, args.normal_only)), flush=True)
+        print(report(estimate(args.run.resolve(), args.jobs, args.elapsed, args.normal_only,
+                                     not args.no_training, args.reranker_only)), flush=True)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"Runtime estimate error: {error}", file=sys.stderr)
         return 1
