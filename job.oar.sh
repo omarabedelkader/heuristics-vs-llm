@@ -41,7 +41,7 @@ done
 export RANKING_SEED="${RANKING_SEED:-42}"
 export RANKING_EPOCHS="${RANKING_EPOCHS:-10}"
 export BENCHMARK_REF="${BENCHMARK_REF:-main}"
-# BENCHMARK_REPO_DIR and RERANKER_PYTHON, if set, are inherited by the pipelines.
+# BENCHMARK_REPO_DIR and PIPELINE_PYTHON, if set, are inherited by the pipeline.
 
 OLLAMA_INSTALL_DIR="$RUN_DIR/ollama-bin"
 
@@ -461,8 +461,8 @@ log "============================================================"
 log "4-PULL MODELS OK"
 
 
-# pipeline-benchmarks.sh restores the pinned dataset when needed (or mines when
-# no snapshot exists), prepares the saved package split, and owns package workers.
+# pipeline-benchmarks.sh builds the experiment image from the benchmark source,
+# saves the benchmark package list, and owns package workers.
 
 
 ###############################################################################
@@ -506,11 +506,9 @@ log "Benchmark packages: $BENCHMARK_PACKAGE_COUNT; concurrent package jobs: $BEN
 log "Seed: $RANKING_SEED"
 log "Experiment: $EXPERIMENT_DIR"
 
-# Run the same maintained pipeline used outside OAR: dataset restoration, the saved
+# Run the same maintained pipeline used outside OAR: the experiment image, the saved
 # benchmark packages, baseline/dependency/LLM/hybrid benchmarks and publication.
-# Ollama stays owned by this wrapper. The neural re-ranker needs no Ollama; submit
-# pipeline-reranker.sh separately with the same EXPERIMENT_DIR (RUN_DIR) so it uses
-# the same saved benchmark packages. Deploy the pipeline scripts and scripts/
+# Ollama stays owned by this wrapper. Deploy pipeline-benchmarks.sh and scripts/
 # alongside job.oar.sh.
 export OLLAMA_BIN OLLAMA_MODELS_DIR
 bash "$ROOT_DIR/pipeline-benchmarks.sh" "$@" &

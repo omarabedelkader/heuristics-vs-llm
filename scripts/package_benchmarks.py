@@ -1,4 +1,4 @@
-"""Bounded package workers, resumable checkpoints and publication aggregation."""
+"""Saved package list, bounded package workers, resumable checkpoints and aggregation."""
 import argparse
 import json
 import math
@@ -11,16 +11,13 @@ import sys
 import time
 import uuid
 
-from ranking_corpus import load_split, read_json, sha256, validate_split
-from runtime_estimate import calibration_packages
+from benchmark_source import read_json, sha256, write_json
 
 
 SCRIPTS = Path(__file__).resolve().parent
-STRATEGIES = {
-    "normal": ("heuristicsBaseline", "heuristicsDependency", "llm05B", "llm15B",
-               "llm3B", "llm7B", "hybrid05B", "hybrid15B", "hybrid3B", "hybrid7B"),
-    "reranker": ("neuralRank10", "neuralRank20", "neuralRank30", "neuralRank50"),
-}
+STRATEGIES = ("heuristicsBaseline", "heuristicsDependency", "llm05B", "llm15B",
+              "llm3B", "llm7B", "hybrid05B", "hybrid15B", "hybrid3B", "hybrid7B")
+SELECTION = "coo-package-split-v1"
 TOTALS = ("count", "reciprocalRankSum", "timeMs", "memoryBytes", "top1", "top2", "top3", "top10")
 # Observations whose target is ranked within the first k (Top-k accuracy, Recall@k).
 HITS = ("top1", "top2", "top3", "top10")
@@ -38,67 +35,91 @@ def positive_jobs(value):
     return int(value)
 
 
+def package_names(value, label):
+    if (not isinstance(value, list) or not value
+            or any(not isinstance(name, str) or not name for name in value)
+            or len(value) != len(set(value))):
+        raise ValueError(f"Invalid or duplicate package names in {label}")
+    return set(value)
+
+
+def load_selection(path):
+    """The saved benchmark packages and the image's eligible packages they were chosen from."""
+    selection = read_json(path)
+    if selection.get("schema") != SELECTION or type(selection.get("seed")) is not int:
+        raise ValueError(f"{path}: not a saved benchmark selection")
+    if not package_names(selection.get("benchmark"), "benchmark") <= package_names(selection.get("eligible"), "eligible"):
+        raise ValueError(f"{path}: benchmark packages outside the eligible packages")
+    return selection
+
+
+def select(packages_path, eligible_path, output, seed=42):
+    """Save a user-supplied list of benchmark packages as the experiment's selection.
+
+    The file is a saved selection, a JSON array of package names, or plain text with
+    one package name per line (# starts a comment)."""
+    eligible = package_names(read_json(eligible_path), str(eligible_path))
+    text = packages_path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = [line.split("#", 1)[0].strip() for line in text.splitlines()]
+        data = [name for name in data if name]
+    if isinstance(data, dict):
+        if data.get("schema") != SELECTION or type(data.get("seed")) is not int:
+            raise ValueError(f"{packages_path}: not a saved benchmark selection")
+        benchmark, seed = data.get("benchmark"), data["seed"]
+    else:
+        benchmark = data
+    names = package_names(benchmark, str(packages_path))
+    unknown = sorted(names - eligible)
+    if unknown:
+        raise ValueError(f"{len(unknown)} listed packages are not benchmark-eligible in this image: "
+                         + ", ".join(unknown[:5]) + (" ..." if len(unknown) > 5 else ""))
+    if names == eligible:
+        raise ValueError("The saved selection format needs at least one eligible package outside the list")
+    if output.exists():
+        if set(read_json(output).get("benchmark", [])) != names:
+            raise ValueError(f"{output} already saves a different benchmark package list; "
+                             "use a new EXPERIMENT_DIR or remove BENCHMARK_PACKAGES_FILE")
+        return read_json(output)
+    selection = dict(schema=SELECTION, seed=seed, eligible=sorted(eligible),
+                     benchmark=sorted(names), train=sorted(eligible - names))
+    write_json(output, selection)
+    return selection
+
+
 def prepare(run, image):
     """Pin every input needed to safely reuse a completed package checkpoint."""
-    split = load_split(run / "split.json")
-    packages = split["benchmark"]
-    if not packages or len(set(packages)) != len(packages):
-        raise ValueError("Empty or duplicate benchmark packages")
+    packages = load_selection(run / "selection.json")["benchmark"]
     inputs = {
-        "split": sha256(run / "split.json"),
-        "corpus": sha256(run / "corpus.json"),
+        "selection": sha256(run / "selection.json"),
         "image": sha256(image / "Pharo.image"),
-        # Only re-ranker runs train, so only they have a training configuration.
-        "trainingConfig": sha256(run / "training-config.json") if (run / "training-config.json").exists() else None,
-        # Runs without the re-ranker (training-config "reranker": false) have no partitions.
-        "partitions": {name: sha256(run / f"{name}.jsonl") if (run / f"{name}.jsonl").exists() else None
-                       for name in ("training", "validation", "test")},
         "scripts": {name: sha256(SCRIPTS / name) for name in (
-            "package_benchmarks.py", "benchmark-package.st", "benchmark-export.st",
-            "ranking_corpus.py", "reranker_workflow.py")},
+            "package_benchmarks.py", "benchmark-package.st", "benchmark-export.st")},
     }
-    if (run / "model-inputs.json").exists():
-        pin_model(run)
     manifest = run / "workers.json"
     if manifest.exists():
         saved = read_json(manifest)
         if saved["inputs"] != inputs or saved["packages"] != packages:
-            raise ValueError("Resume inputs changed (split, corpus, image, model or worker scripts); use a new run")
+            raise ValueError("Resume inputs changed (packages, image or worker scripts); use a new run")
         return saved
-    saved = dict(schema="coo-package-workers-v2", runId=uuid.uuid4().hex,
+    saved = dict(schema="coo-package-workers-v3", runId=uuid.uuid4().hex,
                  inputs=inputs, packages=packages)
     atomic_json(manifest, saved)
     return saved
 
 
-def pin_model(run):
-    """Bind re-ranker checkpoints to the model produced after the normal phase."""
-    split = load_split(run / "split.json")
-    directory = run / "model"
-    metadata = read_json(directory / "metadata.json")
-    if metadata.get("packageSplit") != split:
-        raise ValueError("Trained model must record the same four-part package split")
-    inputs = {p.name: sha256(p) for p in sorted(directory.iterdir()) if p.is_file()}
-    if "ranker.onnx" not in inputs:
-        raise ValueError("Missing trained model")
-    path = run / "model-inputs.json"
-    if path.exists() and read_json(path) != inputs:
-        raise ValueError("Resume inputs changed: trained model differs from saved re-ranker checkpoints")
-    if not path.exists():
-        atomic_json(path, inputs)
-    return inputs
-
-
-def row_keys(phase):
+def row_keys():
     return {(kind, strategy, prefix) for kind in ("messages", "variables")
-            for strategy in STRATEGIES[phase] for prefix in range(2, 9)}
+            for strategy in STRATEGIES for prefix in range(2, 9)}
 
 
-def validate_result(path, package, phase, run_id):
+def validate_result(path, package, run_id):
     result = read_json(path)
-    if (result.get("schema") != "coo-package-result-v1" or result.get("package") != package
-            or result.get("phase") != phase or result.get("runId") != run_id):
-        raise ValueError(f"Wrong package, phase or run identity: {path}")
+    if (result.get("schema") != "coo-package-result-v2" or result.get("package") != package
+            or result.get("runId") != run_id):
+        raise ValueError(f"Wrong package or run identity: {path}")
     corpus = result["corpus"]
     if (set(corpus) != {"packages", "classes", "methods"} or corpus["packages"] != 1
             or any(type(n) is not int or n < 0 for n in corpus.values())):
@@ -106,7 +127,7 @@ def validate_result(path, package, phase, run_id):
     seen = set()
     for row in result["rows"]:
         key = (row["kind"], row["strategy"], row["prefix"])
-        if key in seen or key not in row_keys(phase) or type(row["prefix"]) is not int:
+        if key in seen or key not in row_keys() or type(row["prefix"]) is not int:
             raise ValueError(f"Duplicate or unexpected measurement: {path}: {key}")
         seen.add(key)
         if type(row["count"]) is not int or row["count"] < 0:
@@ -122,7 +143,7 @@ def validate_result(path, package, phase, run_id):
         hits = [row[field] for field in HITS]
         if any(type(n) is not int for n in hits) or not 0 <= hits[0] <= hits[1] <= hits[2] <= hits[3] <= row["count"]:
             raise ValueError(f"Invalid top-k hit counts: {path}")
-    if seen != row_keys(phase):
+    if seen != row_keys():
         raise ValueError(f"Incomplete measurements: {path}")
     return result
 
@@ -164,17 +185,16 @@ def stop_processes(active):
         log.close()
 
 
-def launch(image, directory, package, phase, run_id, split_path, code):
+def launch(image, directory, package, run_id, selection_path, code):
     """Start one isolated Pharo worker; returns (process, log, pending result path)."""
     working = directory / "image"
     copy_image(image, working)
     atomic_json(directory / "package.json", {"package": package})
-    temporary = directory / f"{phase}.pending.json"
+    temporary = directory / "result.pending.json"
     temporary.unlink(missing_ok=True)
-    env = dict(os.environ, BENCHMARK_PACKAGE=package, BENCHMARK_PHASE=phase,
-               BENCHMARK_RUN_ID=run_id, BENCHMARK_OUTPUT=str(temporary),
-               BENCHMARK_SPLIT_FILE=str(split_path))
-    log = (directory / f"{phase}.log").open("w")
+    env = dict(os.environ, BENCHMARK_PACKAGE=package, BENCHMARK_RUN_ID=run_id,
+               BENCHMARK_OUTPUT=str(temporary), BENCHMARK_RUN_SELECTION=str(selection_path))
+    log = (directory / "worker.log").open("w")
     try:
         process = subprocess.Popen(
             [str(image / "pharo"), "--headless", "Pharo.image",
@@ -187,7 +207,7 @@ def launch(image, directory, package, phase, run_id, split_path, code):
     return process, log, temporary
 
 
-def execute(pending, jobs, phase, start, finish):
+def execute(pending, jobs, start, finish):
     """Keep at most `jobs` workers running, starting the next package as a slot frees.
 
     start(index, package) -> (process, log, temporary);
@@ -201,140 +221,68 @@ def execute(pending, jobs, phase, start, finish):
                     continue
                 log.close()
                 if status:
-                    raise RuntimeError(f"{phase} failed for {package} (exit {status}); see {log.name}")
+                    raise RuntimeError(f"Benchmark failed for {package} (exit {status}); see {log.name}")
                 finish(index, package, temporary, time.monotonic() - started)
                 del active[index]
             while pending and len(active) < jobs:
                 index, package = pending.pop(0)
                 process, log, temporary = start(index, package)
                 active[index] = (process, log, package, temporary, time.monotonic())
-                print(f"[{phase}] Started {package} ({len(active)}/{jobs} slots)", flush=True)
+                print(f"Started {package} ({len(active)}/{jobs} slots)", flush=True)
             if active:
                 time.sleep(0.1)
     finally:
         stop_processes(active)
 
 
-def run_workers(run, image, phase, jobs):
+def run_workers(run, image, jobs):
     manifest = prepare(run, image)
-    if phase == "reranker":
-        pin_model(run)
-    rows = read_json(run / "corpus.json")["rowsByPackage"]
+    total = len(manifest["packages"])
     pending = []
     for index, package in enumerate(manifest["packages"]):
-        directory = package_directory(run, index)
-        result = directory / f"{phase}.json"
+        result = package_directory(run, index) / "result.json"
         if result.exists():
-            validate_result(result, package, phase, manifest["runId"])
-            print(f"[{phase}] Reusing {package}", flush=True)
+            validate_result(result, package, manifest["runId"])
+            print(f"Reusing {package}", flush=True)
         else:
             pending.append((index, package))
+    done = [total - len(pending)]
     code = (SCRIPTS / "benchmark-package.st").read_text()
     # Record the user-selected cap for each invocation (including resumed runs).
     with (run / "worker-invocations.jsonl").open("a") as out:
-        out.write(json.dumps(dict(phase=phase, jobs=jobs, pending=len(pending), time=time.time())) + "\n")
+        out.write(json.dumps(dict(jobs=jobs, pending=len(pending), time=time.time())) + "\n")
 
     def start(index, package):
-        return launch(image, package_directory(run, index), package, phase,
-                      manifest["runId"], run / "split.json", code)
+        return launch(image, package_directory(run, index), package,
+                      manifest["runId"], run / "selection.json", code)
 
     def finish(index, package, temporary, seconds):
-        validate_result(temporary, package, phase, manifest["runId"])
-        result = package_directory(run, index) / f"{phase}.json"
+        validate_result(temporary, package, manifest["runId"])
+        result = package_directory(run, index) / "result.json"
         temporary.replace(result)
-        # Actual durations, to compare against estimate.json.
         with (run / "timings.jsonl").open("a") as out:
-            out.write(json.dumps(dict(phase=phase, package=package, rows=rows[package],
-                                      seconds=seconds, jobs=jobs)) + "\n")
-        print(f"[{phase}] Finished {package} in {seconds / 60:.1f} min: {result}", flush=True)
+            out.write(json.dumps(dict(package=package, seconds=seconds, jobs=jobs)) + "\n")
+        done[0] += 1
+        print(f"Finished {package} in {seconds / 60:.1f} min ({done[0]}/{total} packages): {result}", flush=True)
 
-    execute(pending, jobs, phase, start, finish)
-
-
-def prepare_calibration(run, jobs):
-    """Choose the small TRAINING packages that calibration times, once per concurrency."""
-    directory = run / "calibration"
-    info_path = directory / "info.json"
-    if not (info_path.exists() and read_json(info_path)["jobs"] == jobs):
-        shutil.rmtree(directory, ignore_errors=True)
-        directory.mkdir()
-        split = load_split(run / "split.json")
-        rows = read_json(run / "corpus.json")["rowsByPackage"]
-        unused = split.get("unused", [])
-        chosen = calibration_packages(split["train"] + unused, rows, max(jobs, 2))
-        # Only the chosen packages are worker targets; real benchmark packages are relabelled
-        # so the split stays a complete partition, and are never run here.
-        calibration_split = dict(split, benchmark=sorted(chosen),
-                                 train=sorted((set(split["train"]) - set(chosen)) | set(split["benchmark"])))
-        if "unused" in split:
-            calibration_split["unused"] = sorted(set(unused) - set(chosen))
-        validate_split(calibration_split)
-        atomic_json(directory / "split.json", calibration_split)
-        atomic_json(info_path, dict(jobs=jobs, runId=uuid.uuid4().hex, packages=chosen,
-                                    rows={name: rows[name] for name in chosen}))
-    return read_json(info_path)
+    execute(pending, jobs, start, finish)
 
 
-def calibrate(run, image, phase, jobs):
-    """Time real workers on small TRAINING packages at the chosen concurrency.
-
-    Benchmark packages are never touched; results are discarded after timing."""
-    directory = run / "calibration"
-    info = prepare_calibration(run, jobs)
-    if info["jobs"] != jobs:
-        raise ValueError("Calibration concurrency differs; recalibrate the normal phase first")
-    output = directory / f"{phase}.json"
-    if output.exists():
-        print(f"[calibration {phase}] Reusing saved timings", flush=True)
-        return read_json(output)
-    code = (SCRIPTS / "benchmark-package.st").read_text()
-    records = []
-
-    def start(index, package):
-        return launch(image, directory / "packages" / f"{index + 1:04d}", package, phase,
-                      info["runId"], directory / "split.json", code)
-
-    def finish(index, package, temporary, seconds):
-        validate_result(temporary, package, phase, info["runId"])
-        records.append(dict(package=package, rows=info["rows"][package], seconds=seconds))
-        print(f"[calibration {phase}] {package}: {info['rows'][package]} examples in {seconds:.0f} s", flush=True)
-
-    started = time.monotonic()
-    execute(list(enumerate(info["packages"])), jobs, f"calibration {phase}", start, finish)
-    result = dict(jobs=jobs, wallSeconds=time.monotonic() - started, packages=records)
-    atomic_json(output, result)
-    for path in (directory / "packages").glob("*/image"):
-        shutil.rmtree(path)
-    return result
-
-
-def aggregate(run, image, normal_only=False, phases=None):
+def aggregate(run, image):
     manifest = prepare(run, image)
-    if phases is None:
-        phases = ("normal",) if normal_only else tuple(STRATEGIES)
-    if "reranker" in phases:
-        pin_model(run)
-    combined = dict(packages=manifest["packages"], benchmarkPhases=list(phases),
-                    corpus=dict(packages=0, classes=0, methods=0))
-    totals = {phase: {} for phase in phases}
+    combined = dict(packages=manifest["packages"], corpus=dict(packages=0, classes=0, methods=0))
+    totals = {}
     for index, package in enumerate(manifest["packages"]):
-        results = {phase: validate_result(package_directory(run, index) / f"{phase}.json",
-                                         package, phase, manifest["runId"])
-                   for phase in phases}
-        corpus = results[phases[0]]["corpus"]
-        if "reranker" in results and corpus != results["reranker"]["corpus"]:
-            raise ValueError(f"Normal and re-ranker corpus counts differ for {package}")
-        for key, value in corpus.items():
+        result = validate_result(package_directory(run, index) / "result.json", package, manifest["runId"])
+        for key, value in result["corpus"].items():
             combined["corpus"][key] += value
-        for phase, result in results.items():
-            for row in result["rows"]:
-                key = (row["kind"], row["strategy"], row["prefix"])
-                target = totals[phase].setdefault(key, dict(zip(("kind", "strategy", "prefix"), key),
-                                                           **dict.fromkeys(TOTALS, 0)))
-                for field in TOTALS:
-                    target[field] += row[field]
-    for phase in phases:
-        combined[phase] = list(totals[phase].values())
+        for row in result["rows"]:
+            key = (row["kind"], row["strategy"], row["prefix"])
+            target = totals.setdefault(key, dict(zip(("kind", "strategy", "prefix"), key),
+                                                 **dict.fromkeys(TOTALS, 0)))
+            for field in TOTALS:
+                target[field] += row[field]
+    combined["rows"] = list(totals.values())
     path = run / "aggregate.json"
     atomic_json(path, combined)
     return path
@@ -346,37 +294,33 @@ def interrupted(signum, _frame):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "pin-model", "run", "prepare-calibration",
-                                           "calibrate", "aggregate"))
-    parser.add_argument("--run", type=Path, required=True)
-    parser.add_argument("--image", type=Path, required=True)
-    parser.add_argument("--phase", choices=tuple(STRATEGIES))
+    parser.add_argument("action", choices=("select", "prepare", "run", "aggregate"))
+    parser.add_argument("--run", type=Path)
+    parser.add_argument("--image", type=Path)
     parser.add_argument("--jobs", type=positive_jobs)
-    parser.add_argument("--normal-only", action="store_true", help="Aggregate only normal benchmarks")
+    parser.add_argument("--packages", type=Path, help="select: the benchmark package list")
+    parser.add_argument("--eligible", type=Path, help="select: the image's eligible package names")
+    parser.add_argument("--output", type=Path, help="select: the experiment's saved selection")
+    parser.add_argument("--seed", type=int, default=42, help="select: seed recorded for a plain list")
     args = parser.parse_args()
-    if args.action in ("run", "calibrate") and (args.phase is None or args.jobs is None):
-        parser.error(f"{args.action} requires --phase and --jobs (no automatic concurrency)")
-    if args.normal_only and args.action != "aggregate":
-        parser.error("--normal-only applies only to aggregate")
-    if args.action == "prepare-calibration" and args.jobs is None:
-        parser.error("prepare-calibration requires --jobs")
+    if args.action == "select":
+        if args.packages is None or args.eligible is None or args.output is None:
+            parser.error("select requires --packages, --eligible and --output")
+    elif args.run is None or args.image is None:
+        parser.error(f"{args.action} requires --run and --image")
+    if args.action == "run" and args.jobs is None:
+        parser.error("run requires --jobs (no automatic concurrency)")
     signal.signal(signal.SIGTERM, interrupted)
     try:
-        if args.action == "prepare":
+        if args.action == "select":
+            result = select(args.packages, args.eligible, args.output, args.seed)
+            print(f"Benchmark packages: {len(result['benchmark'])} saved in {args.output}")
+        elif args.action == "prepare":
             prepare(args.run.resolve(), args.image.resolve())
-        elif args.action == "pin-model":
-            prepare(args.run.resolve(), args.image.resolve())
-            pin_model(args.run.resolve())
         elif args.action == "run":
-            run_workers(args.run.resolve(), args.image.resolve(), args.phase, args.jobs)
-        elif args.action == "prepare-calibration":
-            prepare_calibration(args.run.resolve(), args.jobs)
-        elif args.action == "calibrate":
-            calibrate(args.run.resolve(), args.image.resolve(), args.phase, args.jobs)
+            run_workers(args.run.resolve(), args.image.resolve(), args.jobs)
         else:
-            # --phase aggregates that phase alone (separate normal and re-ranker pipelines).
-            phases = (args.phase,) if args.phase else None
-            print(aggregate(args.run.resolve(), args.image.resolve(), args.normal_only, phases))
+            print(aggregate(args.run.resolve(), args.image.resolve()))
     except KeyboardInterrupt:
         return 130
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:

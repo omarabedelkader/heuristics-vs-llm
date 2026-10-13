@@ -13,13 +13,13 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import package_benchmarks as workers
 
 
-def result(package, phase, run_id, count=1, rank_sum=1, memory=-10):
-    return dict(schema="coo-package-result-v1", package=package, phase=phase, runId=run_id,
+def result(package, run_id, count=1, rank_sum=1, memory=-10):
+    return dict(schema="coo-package-result-v2", package=package, runId=run_id,
                 corpus=dict(packages=1, classes=2, methods=3),
                 rows=[dict(kind=kind, strategy=strategy, prefix=prefix, count=count,
                            reciprocalRankSum=rank_sum, timeMs=2 * count, memoryBytes=memory,
                            **dict.fromkeys(workers.HITS, min(rank_sum, count)))
-                      for kind, strategy, prefix in sorted(workers.row_keys(phase))])
+                      for kind, strategy, prefix in sorted(workers.row_keys())])
 
 
 class PackageWorkerTests(unittest.TestCase):
@@ -29,48 +29,39 @@ class PackageWorkerTests(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.run = self.root / "run"
         self.image = self.root / "image"
-        (self.run / "model").mkdir(parents=True)
+        self.run.mkdir()
         self.image.mkdir()
         (self.image / "Pharo.image").write_bytes(b"template")
         (self.image / "Pharo.changes").write_bytes(b"changes")
         (self.image / "Pharo.sources").write_bytes(b"sources")
-        (self.run / "model/ranker.onnx").write_bytes(b"onnx")
-        (self.run / "model/metadata.json").write_text("{}")
-        split = dict(schema="coo-package-split-v2", seed=42, eligible=["A", "B", "C", "Train", "Validation", "Test"],
-                     train=["Train"], validation=["Validation"], test=["Test"], benchmark=["A", "B", "C"])
-        workers.atomic_json(self.run / "split.json", split)
-        workers.atomic_json(self.run / "model/metadata.json", dict(packageSplit=split))
-        (self.run / "training-config.json").write_text('{"epochs": 10}')
-        for name in ("training", "validation", "test"):
-            (self.run / f"{name}.jsonl").write_text('{}')
-        workers.atomic_json(self.run / "corpus.json", dict(rowsByPackage={
-            name: 10 * (i + 1) for i, name in enumerate(split["eligible"])}))
+        workers.atomic_json(self.run / "selection.json", dict(
+            schema="coo-package-split-v1", seed=42, eligible=["A", "B", "C", "Other"],
+            benchmark=["A", "B", "C"], train=["Other"]))
         self.manifest = workers.prepare(self.run, self.image)
 
     def checkpoints(self):
         for index, package in enumerate(self.manifest["packages"]):
             directory = workers.package_directory(self.run, index)
             directory.mkdir(parents=True, exist_ok=True)
-            for phase in workers.STRATEGIES:
-                workers.atomic_json(directory / f"{phase}.json", result(
-                    package, phase, self.manifest["runId"], count=(1, 9, 0)[index],
-                    rank_sum=(1, 0, 0)[index], memory=(-10, -90, 0)[index]))
+            workers.atomic_json(directory / "result.json", result(
+                package, self.manifest["runId"], count=(1, 9, 0)[index],
+                rank_sum=(1, 0, 0)[index], memory=(-10, -90, 0)[index]))
 
     def test_aggregate_weights_observations_and_preserves_negative_memory(self):
         self.checkpoints()
         data = workers.read_json(workers.aggregate(self.run, self.image))
         self.assertEqual(data["corpus"], dict(packages=3, classes=6, methods=9))
-        for phase in workers.STRATEGIES:
-            for row in data[phase]:
-                self.assertEqual(row["count"], 10)
-                self.assertEqual(row["reciprocalRankSum"] / row["count"], 0.1)
-                self.assertEqual(row["timeMs"], 20)
-                self.assertEqual(row["memoryBytes"], -100)
-                self.assertEqual([row[field] for field in workers.HITS], [1, 1, 1, 1])
+        self.assertEqual(len(data["rows"]), len(workers.row_keys()))
+        for row in data["rows"]:
+            self.assertEqual(row["count"], 10)
+            self.assertEqual(row["reciprocalRankSum"] / row["count"], 0.1)
+            self.assertEqual(row["timeMs"], 20)
+            self.assertEqual(row["memoryBytes"], -100)
+            self.assertEqual([row[field] for field in workers.HITS], [1, 1, 1, 1])
 
     def test_top_k_hits_must_be_ordered_and_bounded_by_count(self):
         self.checkpoints()
-        path = workers.package_directory(self.run, 1) / "normal.json"
+        path = workers.package_directory(self.run, 1) / "result.json"
         for hits in ([1, 0, 0, 0], [0, 0, 0, 10], [0.5, 1, 1, 1]):
             with self.subTest(hits=hits):
                 data = workers.read_json(path)
@@ -78,14 +69,14 @@ class PackageWorkerTests(unittest.TestCase):
                     row.update(zip(workers.HITS, hits))
                 workers.atomic_json(path, data)
                 with self.assertRaisesRegex(ValueError, "top-k hit counts"):
-                    workers.validate_result(path, self.manifest["packages"][1], "normal", self.manifest["runId"])
+                    workers.validate_result(path, self.manifest["packages"][1], self.manifest["runId"])
 
     def test_missing_or_mismatched_results_block_aggregation(self):
         self.checkpoints()
-        path = workers.package_directory(self.run, 1) / "reranker.json"
+        path = workers.package_directory(self.run, 1) / "result.json"
         original = workers.read_json(path)
         for key, value in (("package", "A"), ("runId", "another-run"),
-                           ("corpus", dict(packages=1, classes=4, methods=3)),
+                           ("corpus", dict(packages=2, classes=4, methods=3)),
                            ("rows", original["rows"][:-1]),
                            ("rows", original["rows"] + original["rows"][:1])):
             with self.subTest(key=key):
@@ -96,24 +87,39 @@ class PackageWorkerTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             workers.aggregate(self.run, self.image)
 
-    def test_normal_only_aggregation_does_not_require_or_include_neural_results(self):
-        self.checkpoints()
-        data = workers.read_json(workers.aggregate(self.run, self.image, normal_only=True))
-        self.assertNotIn('reranker', data)
-        for index in range(3):
-            (workers.package_directory(self.run, index) / 'reranker.json').unlink()
-        self.assertEqual(workers.read_json(workers.aggregate(self.run, self.image, normal_only=True)), data)
-        self.assertEqual(data['benchmarkPhases'], ['normal'])
-        self.assertEqual(data['corpus'], dict(packages=3, classes=6, methods=9))
-        self.assertEqual(data['normal'][0]['count'], 10)
-        with self.assertRaises(FileNotFoundError):
-            workers.aggregate(self.run, self.image)
-
-    def test_changed_model_rejected_on_resume(self):
-        workers.pin_model(self.run)
-        (self.run / "model/ranker.onnx").write_bytes(b"different model")
+    def test_changed_image_or_packages_rejected_on_resume(self):
+        (self.image / "Pharo.image").write_bytes(b"another image")
         with self.assertRaisesRegex(ValueError, "Resume inputs changed"):
             workers.prepare(self.run, self.image)
+        (self.image / "Pharo.image").write_bytes(b"template")
+        workers.prepare(self.run, self.image)
+        selection = workers.read_json(self.run / "selection.json")
+        workers.atomic_json(self.run / "selection.json", dict(selection, benchmark=["A", "B"], train=["C", "Other"]))
+        with self.assertRaisesRegex(ValueError, "Resume inputs changed"):
+            workers.prepare(self.run, self.image)
+
+    def test_user_package_list_is_checked_against_the_image(self):
+        eligible = self.root / "eligible.json"
+        eligible.write_text(json.dumps(["A", "B", "C", "Other"]))
+        packages = self.root / "packages.txt"
+        output = self.root / "benchmark-selection.json"
+        packages.write_text("# mine\nB  # this one\n\nA\n")
+        selection = workers.select(packages, eligible, output)
+        self.assertEqual(selection["benchmark"], ["A", "B"])
+        self.assertEqual(selection["train"], ["C", "Other"])
+        self.assertEqual(workers.load_selection(output), selection)
+        # The same list is reused; a different one needs a new experiment.
+        packages.write_text(json.dumps(["B", "A"]))
+        self.assertEqual(workers.select(packages, eligible, output), selection)
+        packages.write_text("C\n")
+        with self.assertRaisesRegex(ValueError, "different benchmark package list"):
+            workers.select(packages, eligible, output)
+        packages.write_text("Not-A-Package\n")
+        with self.assertRaisesRegex(ValueError, "not benchmark-eligible"):
+            workers.select(packages, eligible, self.root / "other.json")
+        # A saved selection keeps its seed.
+        packages.write_text(json.dumps(dict(selection, seed=7)))
+        self.assertEqual(workers.select(packages, eligible, self.root / "other.json")["seed"], 7)
 
     def stub(self, fail=False, slow=False):
         script = self.image / "pharo"
@@ -136,15 +142,16 @@ if {slow!r}:
 time.sleep(60 if {slow!r} else (0.2 if package == 'B' else 0.7))
 if {fail!r} and package == 'C':
     sys.exit(24)
+assert Path(os.environ['BENCHMARK_RUN_SELECTION']).name == 'selection.json'
 Path(os.environ['BENCHMARK_OUTPUT']).write_text(json.dumps(result(
-    package, os.environ['BENCHMARK_PHASE'], os.environ['BENCHMARK_RUN_ID'])))
+    package, os.environ['BENCHMARK_RUN_ID'])))
 event('finish')
 ''')
         script.chmod(0o755)
 
     def command(self):
         return [sys.executable, str(ROOT / "scripts/package_benchmarks.py"), "run",
-                "--run", str(self.run), "--image", str(self.image), "--phase", "normal", "--jobs", "2"]
+                "--run", str(self.run), "--image", str(self.image), "--jobs", "2"]
 
     def events(self):
         return [json.loads(line) for line in (self.root / "events.jsonl").read_text().splitlines()]
@@ -162,9 +169,9 @@ event('finish')
         # B finishes first: C must start while A is still running.
         self.assertLess(next(e["time"] for e in events if e["package"] == "C"),
                         next(e["time"] for e in events if e["package"] == "A" and e["event"] == "finish"))
-        self.assertTrue((workers.package_directory(self.run, 0) / "normal.json").exists())
-        self.assertTrue((workers.package_directory(self.run, 1) / "normal.json").exists())
-        self.assertFalse((workers.package_directory(self.run, 2) / "normal.json").exists())
+        self.assertTrue((workers.package_directory(self.run, 0) / "result.json").exists())
+        self.assertTrue((workers.package_directory(self.run, 1) / "result.json").exists())
+        self.assertFalse((workers.package_directory(self.run, 2) / "result.json").exists())
         self.stub()
         resumed = subprocess.run(self.command(), capture_output=True, text=True, timeout=10)
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)

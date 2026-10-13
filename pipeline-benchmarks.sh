@@ -1,37 +1,28 @@
 #!/usr/bin/env bash
-# Baseline, dependency, LLM (0.5B/1.5B/3B/7B) and hybrid benchmarks on the saved
-# benchmark packages. Nothing neural is trained or measured here: the neural
-# re-ranker has its own pipeline, pipeline-reranker.sh, on the same saved packages.
+# Baseline, dependency, LLM completion (0.5B/1.5B/3B/7B) and hybrid benchmarks on the
+# saved benchmark packages of one experiment. It builds a Pharo image from your
+# benchmark checkout and benchmarks the image's own packages: no dataset is mined or
+# downloaded. The neural re-ranker and its mined training data live in reranker/.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ESTIMATE=run
 for option in "$@"; do
     case "$option" in
-        --estimate-only) ESTIMATE=only ;;
-        --skip-estimate) ESTIMATE=skip ;;
         --help|-h)
-            echo "Usage: BENCHMARK_JOBS=N $0 [--estimate-only | --skip-estimate]"
-            echo "Runs baseline, dependency, LLM and hybrid benchmarks on the saved benchmark packages."
-            echo "--estimate-only: prepare, time a few training packages on this machine, print the predicted runtime, then stop."
-            echo "--skip-estimate: start benchmarks without the runtime estimate (no calibration)."
+            echo "Usage: BENCHMARK_JOBS=N [BENCHMARK_PACKAGE_COUNT=N] $0"
+            echo "Runs baseline, dependency, LLM completion and hybrid benchmarks on the saved benchmark packages."
+            echo "BENCHMARK_PACKAGE_COUNT=N: benchmark N seeded-random packages of the image (default 50; RANKING_SEED, default 42)."
             echo "BENCHMARK_PACKAGES_FILE=path: benchmark exactly these packages (one name per line, a JSON array, or a saved selection)."
-            echo "The neural re-ranker is separate: pipeline-reranker.sh."
+            echo "BENCHMARK_REPO_DIR=path: the benchmark checkout (default ../HeuristicCompletion-Benchmarks-Multiples)."
+            echo "BENCHMARK_RESUME_DIR=path: continue an interrupted benchmark-run.* directory."
             exit 0 ;;
         *) echo "Unknown option: $option (use --help)" >&2; exit 2 ;;
     esac
 done
-RUN_PREFIX=benchmark-run
 source "$SCRIPT_DIR/scripts/pipeline-common.sh"
 
 prepare_run_directory
-if [[ ! -f "$RUN_DIR/corpus.json" ]]; then
-    # Package sizes for calibration and estimates; no training files are written.
-    "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/ranking_corpus.py" summarize \
-        "$RANKING_CORPUS_DIR" --repository "$MINING_DIR/repository" \
-        --split "$RUN_DIR/split.json" --output "$RUN_DIR"
-fi
 "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" prepare \
     --run "$RUN_DIR" --image "$EXPERIMENT_DIR/image"
 
@@ -103,25 +94,10 @@ fi
 "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/ollama_models.py" \
     "$EXPERIMENT_DIR/llm-models.json" "$RUN_DIR/ollama-tags.json"
 
-# Predict the runtime before the long phase. Calibration times real workers on a few
-# small TRAINING packages (never benchmark packages) at BENCHMARK_JOBS concurrency.
-if [[ "$ESTIMATE" != skip ]]; then
-    echo "Estimating runtime: timing small training packages at $BENCHMARK_JOBS jobs (takes minutes)"
-    "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" calibrate \
-        --run "$RUN_DIR" --image "$EXPERIMENT_DIR/image" --phase normal --jobs "$BENCHMARK_JOBS"
-    "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/runtime_estimate.py" \
-        --run "$RUN_DIR" --jobs "$BENCHMARK_JOBS" --normal-only --no-training --elapsed "$SECONDS"
-    if [[ "$ESTIMATE" == only ]]; then
-        echo "Estimate only: no benchmark package was run. To run this exact prepared experiment:"
-        echo "  BENCHMARK_RESUME_DIR=\"$RUN_DIR\" BENCHMARK_JOBS=$BENCHMARK_JOBS $0"
-        exit 0
-    fi
-fi
-
 echo "Running baseline, dependency, LLM completion and hybrid benchmarks on the saved packages"
-run_package_phase normal
+run_packages
 
 echo "Aggregating all packages and exporting the benchmark files"
-publish_phase normal results-table.tex performance.png dataset-summary.tex recall-top.tex
-echo "Split, package results and logs: $RUN_DIR"
-print_runtime_summary
+publish_results results-table.tex performance.png dataset-summary.tex recall-top.tex
+echo "Packages, package results and logs: $RUN_DIR"
+echo "This invocation took $((SECONDS / 60)) min (per-package times: $RUN_DIR/timings.jsonl)"
