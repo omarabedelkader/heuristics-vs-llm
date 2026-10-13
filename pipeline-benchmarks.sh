@@ -16,10 +16,38 @@ for option in "$@"; do
             echo "BENCHMARK_PACKAGES_FILE=path: benchmark exactly these packages (one name per line, a JSON array, or a saved selection)."
             echo "BENCHMARK_REPO_DIR=path: the benchmark checkout (default ../HeuristicCompletion-Benchmarks-Multiples)."
             echo "BENCHMARK_RESUME_DIR=path: continue an interrupted benchmark-run.* directory."
+            echo "The benchmarks keep running when you press Ctrl-C, close the terminal or leave the SSH session;"
+            echo "their output goes to a log file (BENCHMARK_LOG=path, default benchmark-<date>.log in the current directory)."
+            echo "--foreground: stay attached to this terminal instead (for job schedulers)."
+            echo "Results: RESULTS_DIR/results-before-pharo-validation and RESULTS_DIR/results-after-pharo-validation."
             exit 0 ;;
+        --foreground) ;;
         *) echo "Unknown option: $option (use --help)" >&2; exit 2 ;;
     esac
 done
+if [[ " $* " != *" --foreground "* ]]; then
+    # Start again in a session of its own, without a terminal: closing this one, or
+    # Ctrl-C, no longer reaches the benchmarks. This shell only shows their log.
+    BENCHMARK_LOG="${BENCHMARK_LOG:-$PWD/benchmark-$(date '+%Y%m%d-%H%M%S').log}"
+    : > "$BENCHMARK_LOG"
+    "${PIPELINE_PYTHON:-python3}" -c 'import os, signal, sys
+os.setsid()
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+os.execvp("bash", ["bash", *sys.argv[1:]])' "$SCRIPT_DIR/pipeline-benchmarks.sh" --foreground \
+        > "$BENCHMARK_LOG" 2>&1 < /dev/null &
+    pipeline=$!
+    echo "Benchmarks started (PID $pipeline). They keep running if you press Ctrl-C or close this session."
+    echo "See them again:  tail -f $BENCHMARK_LOG"
+    echo "Stop them:       kill $pipeline"
+    tail -n +1 -f "$BENCHMARK_LOG" &
+    viewer=$!
+    trap 'kill "$viewer" 2>/dev/null; echo; echo "Still running (PID $pipeline). See them again: tail -f $BENCHMARK_LOG"; exit 0' INT
+    status=0
+    wait "$pipeline" || status=$?
+    sleep 1
+    kill "$viewer" 2>/dev/null || true
+    exit "$status"
+fi
 source "$SCRIPT_DIR/scripts/pipeline-common.sh"
 
 prepare_run_directory

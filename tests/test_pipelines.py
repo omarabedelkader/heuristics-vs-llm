@@ -1,6 +1,8 @@
 """Exercise pipeline-benchmarks.sh with download, Pharo and Ollama stand-ins."""
 import hashlib
 import json
+import signal
+import time
 import os
 from pathlib import Path
 import shutil
@@ -54,7 +56,7 @@ from pathlib import Path
 root = Path(os.environ['TEST_ROOT'])
 code = sys.argv[-1]
 with (root / 'pharo-calls.jsonl').open('a') as out:
-    out.write(json.dumps(dict(cwd=str(Path.cwd()), code=code)) + '\\n')
+    out.write(json.dumps(dict(cwd=str(Path.cwd()), code=code, session=os.getsid(0))) + '\\n')
 packages = ['Package-A', 'Package-B', 'Package-C', 'Package-D', 'Package-E', 'Package-F']
 if os.environ.get('TEST_DIFFERENT_POOL'):
     packages.append('New-Package')
@@ -87,6 +89,8 @@ elif 'coo-package-result-v3' in code:
     assert package in selection['benchmark']
     assert Path.cwd().name == 'image' and Path.cwd().parent.parent.name == 'packages'
     assert (Path.cwd() / 'Pharo.image').exists()
+    import time
+    time.sleep(float(os.environ.get('TEST_SLOW_PACKAGE', 0)))
     if os.environ.get('TEST_FAIL_PACKAGE') == package:
         sys.exit(24)
     rows = [dict(kind=kind, strategy=strategy, prefix=prefix, count=2,
@@ -136,8 +140,8 @@ time.sleep(30)
         path.chmod(0o755)
 
     def run_pipeline(self, expected=0, args=()):
-        result = subprocess.run(["bash", str(ROOT / 'pipeline-benchmarks.sh'), *args], env=self.env,
-                                capture_output=True, text=True, timeout=15)
+        result = subprocess.run(["bash", str(ROOT / 'pipeline-benchmarks.sh'), '--foreground', *args],
+                                env=self.env, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         self.assertFalse((self.experiment / ".running").exists())
         self.assertFalse((self.root / 'resutls/.running').exists())
@@ -159,6 +163,49 @@ time.sleep(30)
         self.assertEqual(sorted(p.name for p in ROOT.glob('*.sh')), ['job.oar.sh', 'pipeline-benchmarks.sh'])
         for name in ('ranking_corpus.py', 'reranker_workflow.py', 'download_snapshot.py', 'runtime_estimate.py'):
             self.assertFalse((ROOT / 'scripts' / name).exists(), name)
+
+    def test_default_run_is_detached_from_the_terminal_and_shows_its_log(self):
+        log = self.root / 'my run.log'
+        self.env['BENCHMARK_LOG'] = str(log)
+        result = subprocess.run(["bash", str(ROOT / 'pipeline-benchmarks.sh')], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('keep running if you press Ctrl-C or close this session', result.stdout)
+        self.assertIn(f'tail -f {log}', result.stdout)
+        # The log is shown while it runs, and kept.
+        self.assertIn('Published (after Pharo validation)', result.stdout)
+        self.assertIn('Published (after Pharo validation)', log.read_text())
+        self.assertIn('results-after-pharo-validation/results-table.tex', self.results())
+        # The benchmarks ran in a session of their own, not the launcher's.
+        self.assertNotIn(os.getsid(0), {call['session'] for call in self.calls()})
+
+    def test_detached_run_survives_its_launcher_and_reports_failure(self):
+        log = self.root / 'my run.log'
+        self.env['BENCHMARK_LOG'] = str(log)
+        self.env['TEST_SLOW_PACKAGE'] = '2'
+        launcher = subprocess.Popen(["bash", str(ROOT / 'pipeline-benchmarks.sh')], env=self.env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    start_new_session=True)
+        pid = int(launcher.stdout.readline().split('PID ')[1].split(')')[0])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not log.read_text():
+            time.sleep(0.05)
+        # The terminal goes away: everything in the launcher's session is hung up.
+        os.killpg(launcher.pid, signal.SIGHUP)
+        launcher.wait(timeout=10)
+        self.assertFalse((self.root / 'benchmark-complete').exists(), 'The launcher left before the end')
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and 'This invocation took' not in log.read_text():
+            time.sleep(0.1)
+        self.assertTrue((self.root / 'benchmark-complete').exists(), log.read_text())
+        self.assertIn('Published (after Pharo validation)', log.read_text())
+        # A failing run gives its status to an attached launcher.
+        self.env.pop('TEST_SLOW_PACKAGE')
+        self.env['EXPERIMENT_DIR'] = str(self.root / 'missing parent' / 'experiment')
+        self.env['BENCHMARK_JOBS'] = '0'
+        result = subprocess.run(["bash", str(ROOT / 'pipeline-benchmarks.sh')], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
 
     def test_help_and_unknown_options_before_any_work(self):
         self.env.pop('BENCHMARK_JOBS')

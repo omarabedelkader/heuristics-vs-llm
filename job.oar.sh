@@ -511,7 +511,8 @@ log "Experiment: $EXPERIMENT_DIR"
 # Ollama stays owned by this wrapper. Deploy pipeline-benchmarks.sh and scripts/
 # alongside job.oar.sh.
 export OLLAMA_BIN OLLAMA_MODELS_DIR
-bash "$ROOT_DIR/pipeline-benchmarks.sh" "$@" &
+# --foreground: the job must last as long as the benchmarks.
+bash "$ROOT_DIR/pipeline-benchmarks.sh" --foreground "$@" &
 PIPELINE_PID=$!
 pipeline_status=0
 wait "$PIPELINE_PID" || pipeline_status=$?
