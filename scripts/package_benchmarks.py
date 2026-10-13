@@ -207,16 +207,34 @@ def launch(image, directory, package, run_id, selection_path, code):
     return process, log, temporary
 
 
+PROGRESS = "Progress: "
+
+
+def report_progress(log, package, offset):
+    """Show the benchmarks a worker finished since offset; returns the new offset."""
+    with open(log.name, errors="replace") as source:
+        source.seek(offset)
+        while True:
+            line = source.readline()
+            if not line.endswith("\n"):
+                return offset
+            offset = source.tell()
+            if line.startswith(PROGRESS):
+                print(f"  {package}: {line[len(PROGRESS):].strip()}", flush=True)
+
+
 def execute(pending, jobs, start, finish):
     """Keep at most `jobs` workers running, starting the next package as a slot frees.
 
     start(index, package) -> (process, log, temporary);
     finish(index, package, temporary, seconds) validates and keeps the result."""
     active = {}
+    progress = {}
     try:
         while pending or active:
             for index, (process, log, package, temporary, started) in list(active.items()):
                 status = process.poll()
+                progress[index] = report_progress(log, package, progress.get(index, 0))
                 if status is None:
                     continue
                 log.close()
