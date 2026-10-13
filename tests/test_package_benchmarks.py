@@ -13,12 +13,22 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import package_benchmarks as workers
 
 
+def candidates(strategy, count):
+    """LLM completion rows also count the candidates answered and the real names among them."""
+    if strategy in workers.LLM:
+        return dict(generated=3 * count, valid=3 * count)
+    if strategy in workers.BEFORE_VALIDATION.values():
+        return dict(generated=4 * count, valid=count)
+    return {}
+
+
 def result(package, run_id, count=1, rank_sum=1, memory=-10):
-    return dict(schema="coo-package-result-v2", package=package, runId=run_id,
+    return dict(schema="coo-package-result-v3", package=package, runId=run_id,
                 corpus=dict(packages=1, classes=2, methods=3),
                 rows=[dict(kind=kind, strategy=strategy, prefix=prefix, count=count,
                            reciprocalRankSum=rank_sum, timeMs=2 * count, memoryBytes=memory,
-                           **dict.fromkeys(workers.HITS, min(rank_sum, count)))
+                           **dict.fromkeys(workers.HITS, min(rank_sum, count)),
+                           **candidates(strategy, count))
                       for kind, strategy, prefix in sorted(workers.row_keys())])
 
 
@@ -58,6 +68,43 @@ class PackageWorkerTests(unittest.TestCase):
             self.assertEqual(row["timeMs"], 20)
             self.assertEqual(row["memoryBytes"], -100)
             self.assertEqual([row[field] for field in workers.HITS], [1, 1, 1, 1])
+
+    def test_aggregate_separates_results_before_and_after_pharo_validation(self):
+        self.checkpoints()
+        workers.aggregate(self.run, self.image)
+        before = workers.read_json(self.run / "aggregate-before.json")
+        after = workers.read_json(self.run / "aggregate-after.json")
+        for data in (before, after):
+            self.assertEqual({row["strategy"] for row in data["rows"]}, set(workers.STRATEGIES))
+            self.assertEqual(len(data["rows"]), 2 * len(workers.STRATEGIES) * 7)
+            self.assertEqual(data["corpus"], dict(packages=3, classes=6, methods=9))
+        llm = lambda data: {(row["generated"], row["valid"]) for row in data["rows"] if row["strategy"] in workers.LLM}
+        self.assertEqual(llm(before), {(40, 10)})
+        self.assertEqual(llm(after), {(30, 30)})
+        other = lambda data: sorted((row["kind"], row["strategy"], row["prefix"], row["count"])
+                                    for row in data["rows"] if row["strategy"] not in workers.LLM)
+        self.assertEqual(other(before), other(after))
+        table = (self.run / "pharo-validation.tex").read_text()
+        # Seven prefix sizes: 70 completions, 280 candidates, 70 real names, per model and kind.
+        self.assertEqual(table.count("& 70 & 280 & 70 & 25.0 \\\\"), 8)
+        for label in ("Methods", "Classes", "& 0.5B &", "& 1.5B &", "& 3B &", "& 7B &"):
+            self.assertIn(label, table)
+
+    def test_candidate_counts_are_checked(self):
+        self.checkpoints()
+        path = workers.package_directory(self.run, 1) / "result.json"
+        for strategy, counts in (("llmUnvalidated05B", dict(generated=1, valid=2)),
+                                 ("llmUnvalidated05B", dict(generated=91, valid=0)),
+                                 ("llm7B", dict(generated=5, valid=4)),
+                                 ("llm7B", dict(generated=None, valid=None))):
+            with self.subTest(strategy=strategy, counts=counts):
+                data = result(self.manifest["packages"][1], self.manifest["runId"], count=9, rank_sum=0)
+                for row in data["rows"]:
+                    if row["strategy"] == strategy:
+                        row.update(counts)
+                workers.atomic_json(path, data)
+                with self.assertRaisesRegex(ValueError, "candidate counts"):
+                    workers.validate_result(path, self.manifest["packages"][1], self.manifest["runId"])
 
     def test_top_k_hits_must_be_ordered_and_bounded_by_count(self):
         self.checkpoints()

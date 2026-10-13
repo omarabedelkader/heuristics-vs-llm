@@ -79,9 +79,9 @@ elif 'benchmarkPackages:' in code:
         path.write_text(json.dumps(dict(schema='coo-package-split-v1', seed=42,
             eligible=packages, benchmark=benchmark,
             train=[name for name in packages if name not in benchmark])))
-elif 'coo-package-result-v2' in code:
+elif 'coo-package-result-v3' in code:
     sys.path.insert(0, os.environ['PIPELINE_SCRIPTS'])
-    from package_benchmarks import STRATEGIES
+    from package_benchmarks import MEASURED, LLM, BEFORE_VALIDATION
     package = os.environ['BENCHMARK_PACKAGE']
     selection = json.loads(Path(os.environ['BENCHMARK_RUN_SELECTION']).read_text())
     assert package in selection['benchmark']
@@ -90,11 +90,14 @@ elif 'coo-package-result-v2' in code:
     if os.environ.get('TEST_FAIL_PACKAGE') == package:
         sys.exit(24)
     rows = [dict(kind=kind, strategy=strategy, prefix=prefix, count=2,
-                 reciprocalRankSum=1.0, timeMs=4.0, memoryBytes=-2.0, top1=1, top2=1, top3=1, top10=1)
-            for kind in ('messages', 'variables') for strategy in STRATEGIES
+                 reciprocalRankSum=1.0, timeMs=4.0, memoryBytes=-2.0, top1=1, top2=1, top3=1, top10=1,
+                 **(dict(generated=6, valid=6) if strategy in LLM else
+                    dict(generated=8, valid=2) if strategy in BEFORE_VALIDATION.values() else {}))
+            for kind in ('messages', 'variables') for strategy in MEASURED
             for prefix in range(2, 9)]
+    print('Progress: Methods - Baseline done in 0.0 min (1/28)', flush=True)
     Path(os.environ['BENCHMARK_OUTPUT']).write_text(json.dumps(dict(
-        schema='coo-package-result-v2', package=package,
+        schema='coo-package-result-v3', package=package,
         runId=os.environ['BENCHMARK_RUN_ID'], corpus=dict(packages=1, classes=2, methods=3), rows=rows)))
 elif 'CooPipelineStatistics' in code:
     data = json.loads(Path(os.environ['BENCHMARK_AGGREGATE']).read_text())
@@ -102,10 +105,14 @@ elif 'CooPipelineStatistics' in code:
     assert data['corpus'] == dict(packages=count, classes=2 * count, methods=3 * count)
     assert len(data['rows']) == 2 * 10 * 7
     publication = Path(os.environ['PUBLICATION_DIR'])
+    which = Path(os.environ['BENCHMARK_AGGREGATE']).name
+    assert which == 'aggregate-%s.json' % publication.name, which
+    generated = {row['generated'] for row in data['rows'] if row['strategy'].startswith('llm')}
+    assert generated == ({8 * count} if publication.name == 'before' else {6 * count}), generated
     (publication / 'results-table.tex').write_text('Baseline Dependency LLM 05 15 3 7 Hybrid 05 15 3 7')
     (publication / 'dataset-summary.tex').write_text('Packages: %d' % count)
     (publication / 'recall-top.tex').write_text('Top-1 Top-2 Top-3 Recall@10')
-    if not os.environ.get('TEST_MISSING_FIGURE'):
+    if not (os.environ.get('TEST_MISSING_FIGURE') and publication.name == 'after'):
         (publication / 'performance.png').write_bytes(b'performance image')
     (root / 'benchmark-complete').touch()
 else:
@@ -141,7 +148,9 @@ time.sleep(30)
         return calls if text is None else [c for c in calls if text in c['code']]
 
     def results(self):
-        return {p.name for p in (self.root / 'resutls').iterdir()}
+        """Published files by path below the results directory."""
+        root = self.root / 'resutls'
+        return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob('*') if p.is_file()}
 
     def runs(self):
         return sorted(self.experiment.glob('benchmark-run.*'))
@@ -191,7 +200,13 @@ time.sleep(30)
         self.assertTrue((run / 'packages/0001/result.json').exists())
         timings = [json.loads(line) for line in (run / 'timings.jsonl').read_text().splitlines()]
         self.assertEqual([t['package'] for t in timings], selection['benchmark'])
-        self.assertEqual(self.results(), {'results-table.tex', 'performance.png', 'dataset-summary.tex', 'recall-top.tex'})
+        files = {'results-table.tex', 'performance.png', 'dataset-summary.tex', 'recall-top.tex'}
+        self.assertEqual(set(self.results()), {
+            *('results-after-pharo-validation/' + name for name in files),
+            *('results-before-pharo-validation/' + name for name in files | {'pharo-validation.tex'})})
+        self.assertIn('& 0.5B & 14 & 56 & 14 & 25.0',
+                      self.results()['results-before-pharo-validation/pharo-validation.tex'].decode())
+        self.assertIn(': Methods - Baseline done in 0.0 min (1/28)', result.stdout)
         self.assertFalse((self.root / 'ollama-pid').exists(), 'Existing server must not be restarted')
 
     def test_rerun_reuses_image_source_and_saved_packages(self):
@@ -280,7 +295,7 @@ time.sleep(30)
         self.assertEqual(selection['benchmark'], ['Package-C', 'Package-E'])
         run, = self.runs()
         self.assertEqual(len(list(run.glob('packages/*/result.json'))), 2)
-        self.assertEqual((self.root / 'resutls/dataset-summary.tex').read_text(), 'Packages: 2')
+        self.assertEqual((self.root / 'resutls/results-after-pharo-validation/dataset-summary.tex').read_text(), 'Packages: 2')
         # The saved list is reused without the file, and a different list is refused.
         self.env.pop('BENCHMARK_PACKAGES_FILE')
         self.run_pipeline()
@@ -305,20 +320,20 @@ time.sleep(30)
         failing = json.loads((self.experiment / 'benchmark-selection.json').read_text())['benchmark'][1]
         shutil.rmtree(self.runs()[0])
         (self.root / 'pharo-calls.jsonl').unlink()
-        saved = {p.name: p.read_bytes() for p in (self.root / 'resutls').iterdir()}
+        saved = self.results()
         (self.root / 'benchmark-complete').unlink()
         self.env['TEST_FAIL_PACKAGE'] = failing
         result = self.run_pipeline(1)
         self.assertIn('Resume with BENCHMARK_RESUME_DIR', result.stderr)
         self.assertFalse((self.root / 'benchmark-complete').exists())
-        self.assertEqual({p.name: p.read_bytes() for p in (self.root / 'resutls').iterdir()}, saved)
+        self.assertEqual(self.results(), saved)
         run, = self.runs()
         self.assertEqual(len(list(run.glob('packages/*/result.json'))), 1)
         self.env.pop('TEST_FAIL_PACKAGE')
         self.env['BENCHMARK_RESUME_DIR'] = str(run)
         result = self.run_pipeline()
         self.assertIn('Reusing', result.stdout)
-        self.assertEqual(len(self.calls('coo-package-result-v2')), 4)
+        self.assertEqual(len(self.calls('coo-package-result-v3')), 4)
         self.assertEqual(len(list(run.glob('packages/*/result.json'))), 3)
         self.assertEqual(self.runs(), [run])
         self.assertTrue((self.root / 'benchmark-complete').exists())
@@ -335,7 +350,7 @@ time.sleep(30)
         self.env['TEST_MISSING_FIGURE'] = '1'
         result = self.run_pipeline(1)
         self.assertIn('Missing or empty benchmark artifact', result.stderr)
-        self.assertEqual(self.results(), set())
+        self.assertEqual(self.results(), {})
 
     def test_owned_ollama_stopped_after_run(self):
         self.env['TEST_START_OLLAMA'] = '1'

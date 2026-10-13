@@ -222,21 +222,33 @@ run_packages() {
     fi
 }
 
-# Aggregate the packages, export in Pharo and publish only a complete set of files.
+# Aggregate the packages, export in Pharo and publish only complete sets of files:
+#   RESULTS_DIR/results-before-pharo-validation  LLM completion answers what the model generates
+#   RESULTS_DIR/results-after-pharo-validation   LLM completion answers only real Pharo names
+# Baseline, Dependency and Hybrid are the same measurements in both. pharo-validation.tex
+# (before) counts the generated candidates that are real Pharo names.
 publish_results() {
-    local name
-    export BENCHMARK_AGGREGATE="$RUN_DIR/aggregate.json"
+    local name set
     "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" aggregate \
         --run "$RUN_DIR" --image "$EXPERIMENT_DIR/image"
-    ./pharo --headless Pharo.image --no-default-preferences eval "$(cat "$SCRIPT_DIR/scripts/benchmark-export.st")"
-    for name in "$@"; do
-        if [[ ! -s "$PUBLICATION_DIR/$name" ]]; then
-            echo "Missing or empty benchmark artifact: $PUBLICATION_DIR/$name" >&2
-            exit 1
-        fi
+    local publication="$PUBLICATION_DIR"
+    for set in before after; do
+        export BENCHMARK_AGGREGATE="$RUN_DIR/aggregate-$set.json"
+        export PUBLICATION_DIR="$publication/$set"
+        mkdir -p "$PUBLICATION_DIR"
+        ./pharo --headless Pharo.image --no-default-preferences eval "$(cat "$SCRIPT_DIR/scripts/benchmark-export.st")" > /dev/null
+        for name in "$@"; do
+            if [[ ! -s "$PUBLICATION_DIR/$name" ]]; then
+                echo "Missing or empty benchmark artifact: $PUBLICATION_DIR/$name" >&2
+                exit 1
+            fi
+        done
     done
-    for name in "$@"; do
-        cp "$PUBLICATION_DIR/$name" "$RESULTS_DIR/$name"
+    cp "$RUN_DIR/pharo-validation.tex" "$publication/before/pharo-validation.tex"
+    for set in before after; do
+        mkdir -p "$RESULTS_DIR/results-$set-pharo-validation"
+        cp "$publication/$set"/* "$RESULTS_DIR/results-$set-pharo-validation/"
+        echo "Published ($set Pharo validation): $(ls "$publication/$set" | tr '\n' ' ')-> $RESULTS_DIR/results-$set-pharo-validation"
     done
-    echo "Published $#: $* -> $RESULTS_DIR"
+    export PUBLICATION_DIR="$publication"
 }
