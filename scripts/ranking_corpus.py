@@ -28,7 +28,8 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def repository_sha256(repository):
+def repository_sha256(repository, skip=None):
+    """Hash the frozen source; skip(relative path) leaves a file out."""
     digest = hashlib.sha256()
     for directory in ("src", "reranker"):
         root = repository / directory
@@ -36,7 +37,8 @@ def repository_sha256(repository):
             raise ValueError(f"Missing frozen source directory: {root}")
         for path in sorted(root.rglob("*")):
             if (not path.is_file() or "__pycache__" in path.parts
-                    or path.suffix == ".pyc" or path.name == ".DS_Store"):
+                    or path.suffix == ".pyc" or path.name == ".DS_Store"
+                    or (skip is not None and skip(path.relative_to(repository)))):
                 continue
             digest.update(path.relative_to(repository).as_posix().encode() + b"\0")
             digest.update(sha256(path).encode() + b"\n")

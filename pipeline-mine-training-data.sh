@@ -33,6 +33,9 @@ if [[ ! -d "$REPO_DIR" ]]; then
     if [[ -d "$local_repo/src" ]]; then
         cp -R "$local_repo/src" "$local_repo/scripts" "$local_repo/reranker" "$source_stage/"
         printf 'Local snapshot: %s\n' "$local_repo" > "$source_stage/origin.txt"
+        if commit="$(git -C "$local_repo" rev-parse HEAD 2>/dev/null)"; then
+            printf 'Commit: %s\n' "$commit" >> "$source_stage/origin.txt"
+        fi
     else
         if [[ -n "${BENCHMARK_REPO_DIR:-}" ]]; then
             echo "BENCHMARK_REPO_DIR has no src directory: $local_repo" >&2

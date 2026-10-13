@@ -9,3 +9,5 @@ experiment-necompletion-smoke/
 *.out
 __pycache__/
 .DS_Store
+experiment-*/
+resutls-*/

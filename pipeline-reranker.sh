@@ -56,7 +56,7 @@ fi
 if [[ ! -f "$RUN_DIR/corpus.json" ]]; then
     echo "Preparing train/validation/test files (benchmark packages excluded from ALL three)"
     "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/ranking_corpus.py" partition \
-        "$RANKING_CORPUS_DIR" --repository "$REPO_DIR" \
+        "$RANKING_CORPUS_DIR" --repository "$MINING_DIR/repository" \
         --split "$RUN_DIR/split.json" --output "$RUN_DIR"
 fi
 

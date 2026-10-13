@@ -125,6 +125,8 @@ elif 'CooPipelineStatistics' in code:
         if not os.environ.get('TEST_MISSING_FIGURE'):
             (publication / 'performance-re-ranker.png').write_bytes(b'reranker performance image')
     (root / 'benchmark-complete').touch()
+elif 'MCPackageLoader' in code:
+    Path('Pharo.image').write_text('image with ' + os.environ['REPO_DIR'])
 elif 'Metacello new' not in code:
     raise SystemExit('Unexpected Pharo call: ' + code)
 ''')
@@ -747,6 +749,50 @@ time.sleep(30)
         result = self.run_script('pipeline-benchmarks.sh', 1)
         self.assertIn('Frozen source does not match', result.stderr)
         self.assertEqual(len((self.root / 'downloads').read_text().splitlines()), 1)
+
+    def newer_checkout(self, name):
+        """A second checkout of the mined source with one more file."""
+        self.run_script('pipeline-mine-training-data.sh')
+        checkout = self.root / 'newer-source'
+        shutil.copytree(self.root / 'local-source', checkout)
+        (checkout / 'src/ExtendedHeuristicCompletion-Benchmarks' / name).write_text('newer')
+        self.env['BENCHMARK_REPO_DIR'] = str(checkout)
+        return checkout
+
+    def test_newer_llm_and_hybrid_source_is_loaded_once_without_mining(self):
+        self.newer_checkout('CooLLMBeamReranker.class.st')
+        mining_image = (self.mining / 'image/Pharo.image').read_bytes()
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assertIn('newer LLM/hybrid code', result.stdout)
+        frozen = self.experiment / 'repository'
+        self.assertEqual((frozen / 'src/ExtendedHeuristicCompletion-Benchmarks/CooLLMBeamReranker.class.st').read_text(), 'newer')
+        self.assertIn('Local snapshot', (frozen / 'origin.txt').read_text())
+        image = (self.experiment / 'image/Pharo.image').read_bytes()
+        self.assertNotEqual(image, mining_image)
+        self.assertEqual((self.mining / 'image/Pharo.image').read_bytes(), mining_image)
+        pin = json.loads((self.experiment / 'image-source.json').read_text())
+        self.assertEqual(pin['imageSHA256'], hashlib.sha256(image).hexdigest())
+        self.assertTrue((self.root / 'benchmark-complete').exists())
+        # Both pipelines reuse the pinned image; the source is never loaded again.
+        self.run_script('pipeline-reranker.sh')
+        calls = (self.root / 'pharo-calls.jsonl').read_text()
+        self.assertEqual(calls.count('MCPackageLoader'), 1)
+        self.assertEqual(calls.count('exportRankingCorpusForPackages:'), 1)
+        self.assertEqual((self.experiment / 'image/Pharo.image').read_bytes(), image)
+        # A later change of the checkout is reported, and the frozen source is kept.
+        (self.root / 'newer-source/src/ExtendedHeuristicCompletion-Benchmarks/CooLLMClient.class.st').write_text('later')
+        result = self.run_script('pipeline-benchmarks.sh')
+        self.assertIn("differs from this experiment's frozen source", result.stderr)
+        (self.experiment / 'image/Pharo.image').write_bytes(b'different Pharo build')
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn("Image does not match the experiment's frozen source", result.stderr)
+
+    def test_checkout_changing_mined_code_is_refused(self):
+        self.newer_checkout('CooCandidateFeatureExtractor.class.st')
+        result = self.run_script('pipeline-benchmarks.sh', 1)
+        self.assertIn('mine a new dataset', result.stderr)
+        self.assertFalse((self.experiment / 'repository').exists())
+        self.assertFalse((self.experiment / 'image').exists())
 
 
 if __name__ == '__main__':

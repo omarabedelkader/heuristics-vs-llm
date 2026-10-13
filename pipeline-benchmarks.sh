@@ -29,7 +29,7 @@ prepare_run_directory
 if [[ ! -f "$RUN_DIR/corpus.json" ]]; then
     # Package sizes for calibration and estimates; no training files are written.
     "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/ranking_corpus.py" summarize \
-        "$RANKING_CORPUS_DIR" --repository "$REPO_DIR" \
+        "$RANKING_CORPUS_DIR" --repository "$MINING_DIR/repository" \
         --split "$RUN_DIR/split.json" --output "$RUN_DIR"
 fi
 "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" prepare \

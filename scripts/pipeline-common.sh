@@ -98,23 +98,25 @@ fi
 # Verify before copying the benchmark image. Invalid saved data is never silently replaced.
 "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/ranking_corpus.py" verify \
     "$RANKING_CORPUS_DIR" --repository "$MINING_DIR/repository"
+# The experiment's source is frozen once: the dataset's, or a local checkout whose only
+# differences are LLM, hybrid, chart and test code (scripts/benchmark_source.py).
+BENCHMARK_CHECKOUT="${BENCHMARK_REPO_DIR:-$SCRIPT_DIR/../HeuristicCompletion-Benchmarks-Multiples}"
+benchmark_source() {
+    local action="$1"
+    shift
+    "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/benchmark_source.py" "$action" \
+        --corpus "$RANKING_CORPUS_DIR" --mining "$MINING_DIR/repository" \
+        --repository "$REPO_DIR" --checkout "$BENCHMARK_CHECKOUT" "$@"
+}
 if [[ ! -d "$REPO_DIR" ]]; then
     if [[ -f "$EXPERIMENT_DIR/image-ready" || -f "$BENCHMARK_SELECTION_FILE" ]]; then
         echo "Frozen benchmark source is missing; restore it or use a new EXPERIMENT_DIR." >&2
         exit 1
     fi
-    source_stage="$(mktemp -d "$EXPERIMENT_DIR/source.XXXXXX")"
-    cp -R "$MINING_DIR/repository/." "$source_stage/"
-    mv "$source_stage" "$REPO_DIR"
+    benchmark_source freeze
 fi
 # This small source check also rejects an incompatible repository on reruns.
-"$PIPELINE_PYTHON" - "$SCRIPT_DIR/scripts" "$RANKING_CORPUS_DIR" "$REPO_DIR" <<'PYCODE'
-from pathlib import Path
-import sys
-sys.path.insert(0, sys.argv[1])
-from ranking_corpus import load_manifest
-load_manifest(Path(sys.argv[2]), repository=Path(sys.argv[3]))
-PYCODE
+benchmark_source check
 
 if [[ ! -e "$EXPERIMENT_DIR/image" ]]; then
     if [[ -f "$BENCHMARK_SELECTION_FILE" || -f "$EXPERIMENT_DIR/image-ready" ]]; then
@@ -143,14 +145,29 @@ if [[ ! -f "$EXPERIMENT_DIR/image/Pharo.image" || ! -x "$EXPERIMENT_DIR/image/ph
     exit 1
 fi
 # Check on reruns too, rejecting older experiments that downloaded a different image.
-"$PIPELINE_PYTHON" - "$SCRIPT_DIR/scripts" "$RANKING_CORPUS_DIR" "$EXPERIMENT_DIR/image/Pharo.image" <<'PYCODE'
-from pathlib import Path
-import sys
-sys.path.insert(0, sys.argv[1])
-from ranking_corpus import load_manifest
-load_manifest(Path(sys.argv[2]), image=Path(sys.argv[3]))
-PYCODE
+image_status=0
+benchmark_source check-image --image "$EXPERIMENT_DIR/image/Pharo.image" \
+    --pin "$EXPERIMENT_DIR/image-source.json" || image_status=$?
+if [[ "$image_status" != 0 && "$image_status" != 5 ]]; then
+    exit "$image_status"
+fi
 "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/pharo_runtime.py" "$EXPERIMENT_DIR/image"
+if [[ "$image_status" == 5 ]]; then
+    # The frozen source is newer than the dataset's: load it once into this image.
+    echo "Loading the newer benchmark source into the experiment image"
+    (cd "$EXPERIMENT_DIR/image" && ./pharo --headless Pharo.image eval --save "
+| source |
+source := (OSEnvironment current at: 'REPO_DIR') asFileReference / 'src'.
+#('ExtendedHeuristicCompletion-Benchmarks' 'ExtendedHeuristicCompletion-Benchmarks-Tests') do: [ :name |
+    (PackageOrganizer default hasPackage: name) ifTrue: [
+        MCPackageLoader new
+            updatePackage: (MCPackage named: name)
+            withSnapshot: (TonelReader on: source fileName: name) snapshot;
+            load ] ].
+")
+    benchmark_source pin-image --image "$EXPERIMENT_DIR/image/Pharo.image" \
+        --pin "$EXPERIMENT_DIR/image-source.json"
+fi
 touch "$EXPERIMENT_DIR/image-ready"
 cd "$EXPERIMENT_DIR/image"
 
