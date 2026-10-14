@@ -1,5 +1,6 @@
 """Ensure the frozen benchmark source's models exist in the local Ollama server."""
 import json
+import os
 from pathlib import Path
 import sys
 from urllib.request import Request, urlopen
@@ -15,7 +16,8 @@ def ensure_models(models, tags):
             print(f"Ollama model available: {model}", flush=True)
             continue
         print(f"Pulling Ollama model: {model}", flush=True)
-        request = Request("http://127.0.0.1:11434/api/pull",
+        host = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+        request = Request(f"http://{host}/api/pull",
                           data=json.dumps({"model": model, "stream": True}).encode(),
                           headers={"Content-Type": "application/json"})
         success = False

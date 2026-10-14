@@ -30,6 +30,7 @@ class PipelineTests(unittest.TestCase):
         self.env = {**os.environ, "EXPERIMENT_DIR": str(self.experiment),
                     "BENCHMARK_REPO_DIR": str(self.checkout),
                     "BENCHMARK_PACKAGE_COUNT": "1", "BENCHMARK_JOBS": "2", "RANKING_SEED": "42",
+                    "BENCHMARK_OLLAMA_HOST": "127.0.0.1:11434",
                     "RESULTS_DIR": str(self.root / "resutls"),
                     "TEST_ROOT": str(self.root), "PATH": str(binaries) + os.pathsep + os.environ['PATH']}
         for name in ("MINING_DIR", "PIPELINE_PYTHON", "BENCHMARK_PACKAGES_FILE", "BENCHMARK_RESUME_DIR"):
@@ -38,7 +39,7 @@ class PipelineTests(unittest.TestCase):
 import json, os, sys
 from pathlib import Path
 root = Path(os.environ['TEST_ROOT'])
-if 'http://127.0.0.1:11434/api/tags' in sys.argv:
+if any(arg.endswith('/api/tags') for arg in sys.argv):
     if os.environ.get('TEST_START_OLLAMA') and not (root / 'ollama-ready').exists():
         sys.exit(7)
     print(json.dumps({'models': [{'name': 'model-' + size} for size in ['05', '15', '3', '7']]}))
@@ -81,13 +82,16 @@ elif 'benchmarkPackages:' in code:
         path.write_text(json.dumps(dict(schema='coo-package-split-v1', seed=42,
             eligible=packages, benchmark=benchmark,
             train=[name for name in packages if name not in benchmark])))
-elif 'coo-package-result-v3' in code:
+elif 'coo-package-part-v1' in code:
     sys.path.insert(0, os.environ['PIPELINE_SCRIPTS'])
     from package_benchmarks import MEASURED, LLM, BEFORE_VALIDATION
     package = os.environ['BENCHMARK_PACKAGE']
     selection = json.loads(Path(os.environ['BENCHMARK_RUN_SELECTION']).read_text())
     assert package in selection['benchmark']
-    assert Path.cwd().name == 'image' and Path.cwd().parent.parent.name == 'packages'
+    kind, strategy = os.environ['BENCHMARK_KIND'], os.environ['BENCHMARK_STRATEGY']
+    assert Path.cwd().name == 'image' and Path.cwd().parent.name == kind + '-' + strategy
+    assert Path.cwd().parents[3].name == 'packages'
+    assert os.environ['BENCHMARK_OLLAMA_URL'] == 'http://' + os.environ['OLLAMA_HOST']
     assert (Path.cwd() / 'Pharo.image').exists()
     import time
     time.sleep(float(os.environ.get('TEST_SLOW_PACKAGE', 0)))
@@ -97,11 +101,11 @@ elif 'coo-package-result-v3' in code:
                  reciprocalRankSum=1.0, timeMs=4.0, memoryBytes=-2.0, top1=1, top2=1, top3=1, top10=1,
                  **(dict(generated=6, valid=6) if strategy in LLM else
                     dict(generated=8, valid=2) if strategy in BEFORE_VALIDATION.values() else {}))
-            for kind in ('messages', 'variables') for strategy in MEASURED
             for prefix in range(2, 9)]
-    print('Progress: Methods - Baseline done in 0.0 min (1/28)', flush=True)
+    if strategy == 'heuristicsBaseline' and kind == 'messages':
+        print('Progress: Methods - Baseline done in 0.0 min', flush=True)
     Path(os.environ['BENCHMARK_OUTPUT']).write_text(json.dumps(dict(
-        schema='coo-package-result-v3', package=package,
+        schema='coo-package-part-v1', package=package, kind=kind, strategy=strategy,
         runId=os.environ['BENCHMARK_RUN_ID'], corpus=dict(packages=1, classes=2, methods=3), rows=rows)))
 elif 'CooPipelineStatistics' in code:
     data = json.loads(Path(os.environ['BENCHMARK_AGGREGATE']).read_text())
@@ -129,6 +133,8 @@ import os, time
 from pathlib import Path
 root = Path(os.environ['TEST_ROOT'])
 (root / 'ollama-pid').write_text(str(os.getpid()))
+(root / 'ollama-env.json').write_text(__import__('json').dumps({k: os.environ.get(k) for k in (
+    'OLLAMA_HOST', 'OLLAMA_NUM_PARALLEL', 'OLLAMA_MAX_LOADED_MODELS', 'OLLAMA_MODELS')}))
 (root / 'ollama-ready').touch()
 time.sleep(30)
 ''')
@@ -160,7 +166,7 @@ time.sleep(30)
         return sorted(self.experiment.glob('benchmark-run.*'))
 
     def test_only_the_benchmark_and_cluster_entry_points_remain(self):
-        self.assertEqual(sorted(p.name for p in ROOT.glob('*.sh')), ['job.oar.sh', 'pipeline-benchmarks.sh'])
+        self.assertEqual(sorted(p.name for p in ROOT.glob('*.sh')), ['job.fir.sh', 'job.oar.sh', 'pipeline-benchmarks.sh'])
         for name in ('ranking_corpus.py', 'reranker_workflow.py', 'download_snapshot.py', 'runtime_estimate.py'):
             self.assertFalse((ROOT / 'scripts' / name).exists(), name)
 
@@ -253,7 +259,7 @@ time.sleep(30)
             *('results-before-pharo-validation/' + name for name in files | {'pharo-validation.tex'})})
         self.assertIn('& 0.5B & 14 & 56 & 14 & 25.0',
                       self.results()['results-before-pharo-validation/pharo-validation.tex'].decode())
-        self.assertIn(': Methods - Baseline done in 0.0 min (1/28)', result.stdout)
+        self.assertIn('[messages heuristicsBaseline]: Methods - Baseline done in 0.0 min', result.stdout)
         self.assertFalse((self.root / 'ollama-pid').exists(), 'Existing server must not be restarted')
 
     def test_rerun_reuses_image_source_and_saved_packages(self):
@@ -375,12 +381,15 @@ time.sleep(30)
         self.assertFalse((self.root / 'benchmark-complete').exists())
         self.assertEqual(self.results(), saved)
         run, = self.runs()
-        self.assertEqual(len(list(run.glob('packages/*/result.json'))), 1)
+        done = len(list(run.glob('packages/*/benchmarks/*/part.json')))
+        self.assertGreater(done, 0)
+        self.assertFalse(list(run.glob('packages/*/result.json')))
         self.env.pop('TEST_FAIL_PACKAGE')
         self.env['BENCHMARK_RESUME_DIR'] = str(run)
+        (self.root / 'pharo-calls.jsonl').unlink()
         result = self.run_pipeline()
-        self.assertIn('Reusing', result.stdout)
-        self.assertEqual(len(self.calls('coo-package-result-v3')), 4)
+        # Only the benchmarks that had not finished run again.
+        self.assertEqual(len(self.calls('coo-package-part-v1')), 3 * 28 - done)
         self.assertEqual(len(list(run.glob('packages/*/result.json'))), 3)
         self.assertEqual(self.runs(), [run])
         self.assertTrue((self.root / 'benchmark-complete').exists())
@@ -401,8 +410,15 @@ time.sleep(30)
 
     def test_owned_ollama_stopped_after_run(self):
         self.env['TEST_START_OLLAMA'] = '1'
+        self.env.pop('BENCHMARK_OLLAMA_HOST')
         self.run_pipeline()
         pid = int((self.root / 'ollama-pid').read_text())
+        # Its own port, one request slot per worker, all four models kept loaded.
+        env = json.loads((self.root / 'ollama-env.json').read_text())
+        self.assertRegex(env['OLLAMA_HOST'], r'^127\.0\.0\.1:[1-9][0-9]*$')
+        self.assertEqual(env['OLLAMA_NUM_PARALLEL'], '2')
+        self.assertEqual(env['OLLAMA_MAX_LOADED_MODELS'], '4')
+        self.assertEqual(env['OLLAMA_MODELS'], str(self.root / 'models'))
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 

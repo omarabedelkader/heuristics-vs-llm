@@ -8,7 +8,7 @@
 # BENCHMARK_PACKAGES_FILE supplies your own package list instead of a seeded selection.
 
 if [[ ! "${BENCHMARK_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Set BENCHMARK_JOBS to the number of simultaneous package jobs you want (positive integer)." >&2
+    echo "Set BENCHMARK_JOBS to the number of simultaneous benchmarks you want (positive integer)." >&2
     exit 1
 fi
 export BENCHMARK_JOBS
@@ -206,7 +206,7 @@ prepare_run_directory() {
     export RUN_DIR
     export PUBLICATION_DIR="$(mktemp -d "$RUN_DIR/publication.XXXXXX")"
     echo "Run directory: $RUN_DIR"
-    echo "Package concurrency selected by you: $BENCHMARK_JOBS"
+    echo "Benchmarks running at the same time (BENCHMARK_JOBS): $BENCHMARK_JOBS"
 }
 
 run_packages() {
