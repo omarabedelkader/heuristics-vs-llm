@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # Slurm job for the Fir cluster (Digital Research Alliance of Canada).
-# It runs the same benchmarks as job.oar.sh, on a 40 GB slice (MIG 3g.40gb) of an
-# NVIDIA H100: the largest model (7b) fits, and slices start sooner than full GPUs.
+# It runs the same benchmarks as job.oar.sh, on a full NVIDIA H100 80 GB. For a
+# 40 GB slice, which starts sooner, use --gpus-per-node=nvidia_h100_80gb_hbm3_3g.40gb:1.
 #
 # Submit it from the repository directory on Fir:
 #     cd ~/projects/def-YOURPI/heuristics-vs-llm
@@ -12,10 +12,10 @@
 # Cancel it:   scancel <jobid>
 
 #SBATCH --job-name=heuristic-completion-benchmark
-#SBATCH --gpus-per-node=nvidia_h100_80gb_hbm3_3g.40gb:1
+#SBATCH --gpus-per-node=h100:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=64G
-#SBATCH --time=10:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=heuristic-completion.%j.out
 #SBATCH --error=heuristic-completion.%j.err
 
@@ -39,6 +39,7 @@ export RUN_DIR="${RUN_DIR:-$ROOT_DIR/slurm-runs/${SLURM_JOB_ID:-manual-$(date '+
 export OLLAMA_MODELS_DIR="${OLLAMA_MODELS_DIR:-$ROOT_DIR/.ollama-models}"
 # One benchmark worker per CPU core requested above; Ollama gets as many request slots.
 export BENCHMARK_JOBS="${BENCHMARK_JOBS:-12}"
+export BENCHMARK_PACKAGE_COUNT="${BENCHMARK_PACKAGE_COUNT:-50}"
 
 echo "Slurm job ${SLURM_JOB_ID:-manual} on $(hostname), GPUs: ${CUDA_VISIBLE_DEVICES:-none}"
 exec bash "$ROOT_DIR/job.oar.sh" "$@"
