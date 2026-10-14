@@ -1,12 +1,9 @@
-"Run one benchmark package and retain sufficient statistics, without rounding.
+"Run ONE benchmark (BENCHMARK_KIND x BENCHMARK_STRATEGY) of one package and retain
+sufficient statistics, without rounding. The pipeline runs the 28 benchmarks of every
+package as separate, concurrent workers and merges their parts.
 LLM completion runs twice: before Pharo validation (the candidates are what the model
 generates, real names or not) and after it (only real names of the image)."
-| selection packageName package strategies unvalidated labelFor kinds results done rows output ollamaHost |
-"The pipeline picks an Ollama server recent enough for log-probabilities; use it."
-ollamaHost := OSEnvironment current at: 'OLLAMA_HOST' ifAbsent: [ nil ].
-ollamaHost ifNotNil: [
-    CooLLMClient default baseUrl: ((ollamaHost includesSubstring: '://')
-        ifTrue: [ ollamaHost ] ifFalse: [ 'http://' , ollamaHost ]) ].
+| selection packageName package strategies unvalidated labelFor kinds kind strategy benchmark started rows output |
 selection := STONJSON fromString: (OSEnvironment current at: 'BENCHMARK_RUN_SELECTION') asFileReference contents.
 (selection at: 'schema') = 'coo-package-split-v1' ifFalse: [ Error signal: 'Saved benchmark selection required' ].
 (selection at: 'eligible') asSet = CooBenchRunner eligiblePackageNames asSet ifFalse: [
@@ -28,63 +25,58 @@ labelFor := [ :strategy |
         ifFalse: [ (CooBenchmarkChart labelFor: strategy) ,
             ((unvalidated includes: strategy) ifTrue: [ ' AFTER Pharo validation' ] ifFalse: [ '' ]) ] ].
 package := PackageOrganizer default packageNamed: packageName.
-kinds := { #messages -> CooBenchRunnerMessage. #variables -> CooBenchRunnerVariables }.
-"One benchmark at a time, so each one is reported as soon as it is done (the pipeline shows these lines)."
-results := Dictionary new.
-done := 0.
-kinds do: [ :kind |
-    strategies do: [ :strategy |
-        | runner benchmark started |
-        started := Time millisecondClockValue.
-        runner := kind value new package: package; baseline: strategy; others: #(); run; yourself.
-        benchmark := runner results at: strategy.
-        results at: kind key -> strategy put: benchmark.
-        done := done + 1.
-        Stdio stdout
-            nextPutAll: 'Progress: ';
-            nextPutAll: (CooBenchmarkChart labelForKind: kind key); nextPutAll: ' - ';
-            nextPutAll: (labelFor value: strategy); nextPutAll: ' done in ';
-            nextPutAll: ((Time millisecondClockValue - started) / 60000.0 printShowingDecimalPlaces: 1);
-            nextPutAll: ' min ('; print: done; nextPut: $/; print: kinds size * strategies size; nextPut: $).
-        (unvalidated includesKey: strategy) ifTrue: [
-            | generated valid |
-            generated := (2 to: 8) inject: 0 into: [ :sum :prefix | sum + (benchmark generatedForPrefixSize: prefix) ].
-            valid := (2 to: 8) inject: 0 into: [ :sum :prefix | sum + (benchmark validForPrefixSize: prefix) ].
-            Stdio stdout nextPutAll: ': '; print: valid; nextPutAll: ' of '; print: generated;
-                nextPutAll: ' generated candidates are real Pharo names'.
-            generated > 0 ifTrue: [
-                Stdio stdout nextPutAll: ' ('; nextPutAll: (valid * 100 / generated printShowingDecimalPlaces: 1); nextPutAll: '%)' ] ].
-        Stdio stdout lf; flush ] ].
+kinds := Dictionary newFrom: { #messages -> CooBenchRunnerMessage. #variables -> CooBenchRunnerVariables }.
+kind := (OSEnvironment current at: 'BENCHMARK_KIND') asSymbol.
+strategy := (OSEnvironment current at: 'BENCHMARK_STRATEGY') asSymbol.
+(kinds includesKey: kind) ifFalse: [ Error signal: 'Unknown benchmark kind: ', kind ].
+(strategies includes: strategy) ifFalse: [ Error signal: 'Unknown benchmark strategy: ', strategy ].
+"The pipeline's own Ollama server (tuned for concurrent requests), when it names one."
+(OSEnvironment current at: 'BENCHMARK_OLLAMA_URL' ifAbsent: [ '' ]) ifNotEmpty: [ :url |
+    CooLLMClient default baseUrl: url ].
+started := Time millisecondClockValue.
+benchmark := ((kinds at: kind) new package: package; baseline: strategy; others: #(); run; yourself)
+    results at: strategy.
+Stdio stdout
+    nextPutAll: 'Progress: ';
+    nextPutAll: (CooBenchmarkChart labelForKind: kind); nextPutAll: ' - ';
+    nextPutAll: (labelFor value: strategy); nextPutAll: ' done in ';
+    nextPutAll: ((Time millisecondClockValue - started) / 60000.0 printShowingDecimalPlaces: 1);
+    nextPutAll: ' min'.
+(unvalidated includesKey: strategy) ifTrue: [
+    | generated valid |
+    generated := (2 to: 8) inject: 0 into: [ :sum :prefix | sum + (benchmark generatedForPrefixSize: prefix) ].
+    valid := (2 to: 8) inject: 0 into: [ :sum :prefix | sum + (benchmark validForPrefixSize: prefix) ].
+    Stdio stdout nextPutAll: ': '; print: valid; nextPutAll: ' of '; print: generated;
+        nextPutAll: ' generated candidates are real Pharo names'.
+    generated > 0 ifTrue: [
+        Stdio stdout nextPutAll: ' ('; nextPutAll: (valid * 100 / generated printShowingDecimalPlaces: 1); nextPutAll: '%)' ] ].
+Stdio stdout lf; flush.
 rows := OrderedCollection new.
-kinds do: [ :entry |
-    | kind |
-    kind := entry key.
-    strategies do: [ :strategy |
-        | benchmark |
-        benchmark := results at: kind -> strategy.
-        2 to: 8 do: [ :prefix |
-            | count |
-            count := benchmark totalEntriesPerPrefixSize: prefix.
-            rows add: (Dictionary new
-                at: 'kind' put: kind asString;
-                at: 'strategy' put: strategy asString;
-                at: 'prefix' put: prefix;
-                at: 'count' put: count;
-                at: 'reciprocalRankSum' put: (count * (benchmark mmrForPrefixSize: prefix)) asFloat;
-                at: 'timeMs' put: (benchmark totalTimeForPrefix: prefix) asFloat;
-                at: 'memoryBytes' put: (benchmark totalMemoryForPrefix: prefix) asFloat;
-                yourself).
-            (benchmark respondsTo: #generatedForPrefixSize:) ifTrue: [
-                rows last
-                    at: 'generated' put: (benchmark generatedForPrefixSize: prefix);
-                    at: 'valid' put: (benchmark validForPrefixSize: prefix) ].
-            "Hits: observations whose target is ranked within the first k (Top-k / Recall@k)."
-            #(1 2 3 10) do: [ :k |
-                rows last at: 'top', k printString put:
-                    (count * (benchmark accuracyForCompletionIndex: (1 to: k) withPrefixSize: prefix)) rounded ] ] ] ].
+2 to: 8 do: [ :prefix |
+    | count |
+    count := benchmark totalEntriesPerPrefixSize: prefix.
+    rows add: (Dictionary new
+        at: 'kind' put: kind asString;
+        at: 'strategy' put: strategy asString;
+        at: 'prefix' put: prefix;
+        at: 'count' put: count;
+        at: 'reciprocalRankSum' put: (count * (benchmark mmrForPrefixSize: prefix)) asFloat;
+        at: 'timeMs' put: (benchmark totalTimeForPrefix: prefix) asFloat;
+        at: 'memoryBytes' put: (benchmark totalMemoryForPrefix: prefix) asFloat;
+        yourself).
+    (benchmark respondsTo: #generatedForPrefixSize:) ifTrue: [
+        rows last
+            at: 'generated' put: (benchmark generatedForPrefixSize: prefix);
+            at: 'valid' put: (benchmark validForPrefixSize: prefix) ].
+    "Hits: observations whose target is ranked within the first k (Top-k / Recall@k)."
+    #(1 2 3 10) do: [ :k |
+        rows last at: 'top', k printString put:
+            (count * (benchmark accuracyForCompletionIndex: (1 to: k) withPrefixSize: prefix)) rounded ] ].
 output := Dictionary new
-    at: 'schema' put: 'coo-package-result-v3';
+    at: 'schema' put: 'coo-package-part-v1';
     at: 'package' put: packageName;
+    at: 'kind' put: kind asString;
+    at: 'strategy' put: strategy asString;
     at: 'runId' put: (OSEnvironment current at: 'BENCHMARK_RUN_ID');
     at: 'corpus' put: (CooBenchRunner corpusSummaryForPackageNames: { packageName });
     at: 'rows' put: rows asArray;

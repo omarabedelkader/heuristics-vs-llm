@@ -32,6 +32,13 @@ def result(package, run_id, count=1, rank_sum=1, memory=-10):
                       for kind, strategy, prefix in sorted(workers.row_keys())])
 
 
+def part(package, run_id, kind, strategy):
+    """The output of one benchmark worker: the seven prefix rows of one kind and strategy."""
+    data = result(package, run_id)
+    return dict(data, schema="coo-package-part-v1", kind=kind, strategy=strategy,
+                rows=[row for row in data["rows"] if (row["kind"], row["strategy"]) == (kind, strategy)])
+
+
 class PackageWorkerTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="package workers ")
@@ -168,30 +175,33 @@ class PackageWorkerTests(unittest.TestCase):
         packages.write_text(json.dumps(dict(selection, seed=7)))
         self.assertEqual(workers.select(packages, eligible, self.root / "other.json")["seed"], 7)
 
-    def stub(self, fail=False, slow=False):
+    def stub(self, fail=False, slow=False, pause=0):
         script = self.image / "pharo"
         script.write_text(f'''#!{sys.executable}
 import json, os, sys, time, subprocess
 from pathlib import Path
 sys.path.insert(0, {str(ROOT / 'tests')!r})
-from test_package_benchmarks import result
+from test_package_benchmarks import part
 root = Path({str(self.root)!r})
 package = os.environ['BENCHMARK_PACKAGE']
-def event(kind):
+kind, strategy = os.environ['BENCHMARK_KIND'], os.environ['BENCHMARK_STRATEGY']
+first = (kind, strategy) == ('messages', 'llmUnvalidated7B')
+def event(name):
     with (root / 'events.jsonl').open('a') as out:
-        out.write(json.dumps(dict(event=kind, package=package, time=time.monotonic(), pid=os.getpid())) + '\\n')
+        out.write(json.dumps(dict(event=name, package=package, kind=kind, strategy=strategy,
+                                  time=time.monotonic(), pid=os.getpid())) + '\\n')
 event('start')
 assert Path('Pharo.image').read_bytes() == b'template'
 assert Path('Pharo.sources').read_bytes() == b'sources'
 if {slow!r}:
     child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
     (root / ('child-' + package)).write_text(str(child.pid))
-time.sleep(60 if {slow!r} else (0.2 if package == 'B' else 0.7))
+time.sleep(60 if {slow!r} else ({pause!r} if not first else 0.2 if package == 'B' else 0.7))
 if {fail!r} and package == 'C':
     sys.exit(24)
 assert Path(os.environ['BENCHMARK_RUN_SELECTION']).name == 'selection.json'
-Path(os.environ['BENCHMARK_OUTPUT']).write_text(json.dumps(result(
-    package, os.environ['BENCHMARK_RUN_ID'])))
+Path(os.environ['BENCHMARK_OUTPUT']).write_text(json.dumps(part(
+    package, os.environ['BENCHMARK_RUN_ID'], kind, strategy)))
 event('finish')
 ''')
         script.chmod(0o755)
@@ -203,7 +213,11 @@ event('finish')
     def events(self):
         return [json.loads(line) for line in (self.root / "events.jsonl").read_text().splitlines()]
 
-    def test_two_slots_refill_and_resume_keeps_completed_packages(self):
+    def parts(self):
+        return {(path.parent.parent.parent.name, path.parent.name)
+                for path in self.run.glob("packages/*/benchmarks/*/part.json")}
+
+    def test_two_slots_refill_and_resume_keeps_completed_benchmarks(self):
         self.stub(fail=True)
         failed = subprocess.run(self.command(), capture_output=True, text=True, timeout=10)
         self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
@@ -213,22 +227,52 @@ event('finish')
             active += 1 if event["event"] == "start" else -1
             peak = max(peak, active)
         self.assertEqual(peak, 2)
+        # The longest benchmark (7B before validation) runs first for every package.
+        starts = [(e["package"], e["kind"], e["strategy"]) for e in events if e["event"] == "start"]
+        self.assertEqual(set(starts[:2]), {("A", "messages", "llmUnvalidated7B"),
+                                           ("B", "messages", "llmUnvalidated7B")})
         # B finishes first: C must start while A is still running.
         self.assertLess(next(e["time"] for e in events if e["package"] == "C"),
                         next(e["time"] for e in events if e["package"] == "A" and e["event"] == "finish"))
-        self.assertTrue((workers.package_directory(self.run, 0) / "result.json").exists())
-        self.assertTrue((workers.package_directory(self.run, 1) / "result.json").exists())
-        self.assertFalse((workers.package_directory(self.run, 2) / "result.json").exists())
+        self.assertIn(("0002", "messages-llmUnvalidated7B"), self.parts())
+        self.assertFalse(any(name == "0003" for name, _ in self.parts()))
+        self.assertFalse(list(self.run.glob("packages/*/result.json")))
+        done = self.parts()
         self.stub()
-        resumed = subprocess.run(self.command(), capture_output=True, text=True, timeout=10)
+        (self.root / "events.jsonl").unlink()
+        resumed = subprocess.run(self.command(), capture_output=True, text=True, timeout=30)
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        starts = [e["package"] for e in self.events() if e["event"] == "start"]
-        self.assertEqual(starts.count("A"), 1)
-        self.assertEqual(starts.count("B"), 1)
-        self.assertEqual(starts.count("C"), 2)
+        # Every benchmark runs once more only if it had not finished before.
+        starts = [(f"{'ABC'.index(e['package']) + 1:04d}", f"{e['kind']}-{e['strategy']}")
+                  for e in self.events() if e["event"] == "start"]
+        self.assertEqual(len(starts), len(set(starts)))
+        self.assertFalse(done & set(starts))
+        self.assertEqual(len(starts) + len(done), 3 * len(workers.KINDS) * len(workers.MEASURED))
+        for index, package in enumerate("ABC"):
+            workers.validate_result(workers.package_directory(self.run, index) / "result.json",
+                                    package, self.manifest["runId"])
+        self.assertEqual(len((self.run / "timings.jsonl").read_text().splitlines()), 3)
         self.assertEqual((self.image / "Pharo.image").read_bytes(), b"template")
-        self.assertNotEqual((workers.package_directory(self.run, 0) / "image/Pharo.image").stat().st_ino,
-                            (workers.package_directory(self.run, 1) / "image/Pharo.image").stat().st_ino)
+        # A finished benchmark keeps its part, not its private image copy.
+        self.assertFalse(list(self.run.glob("packages/*/benchmarks/*/image")))
+
+    def test_one_package_uses_every_slot(self):
+        selection = workers.read_json(self.run / "selection.json")
+        workers.atomic_json(self.run / "selection.json", dict(selection, benchmark=["A"], train=["B", "C", "Other"]))
+        (self.run / "workers.json").unlink()
+        self.manifest = workers.prepare(self.run, self.image)
+        self.stub(pause=0.5)
+        command = self.command()
+        command[-1] = "4"
+        finished = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        active = peak = 0
+        for event in self.events():
+            active += 1 if event["event"] == "start" else -1
+            peak = max(peak, active)
+        self.assertEqual(peak, 4)
+        workers.validate_result(workers.package_directory(self.run, 0) / "result.json",
+                                "A", self.manifest["runId"])
 
     def test_termination_stops_worker_processes(self):
         self.stub(slow=True)

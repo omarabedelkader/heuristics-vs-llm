@@ -1,4 +1,8 @@
-"""Saved package list, bounded package workers, resumable checkpoints and aggregation."""
+"""Saved package list, bounded benchmark workers, resumable checkpoints and aggregation.
+
+Each package is split into its 28 independent benchmarks (2 kinds x 14 strategies).
+Every benchmark runs in its own Pharo process, so all --jobs slots stay busy even with
+one package, and the Ollama server batches the concurrent requests of the workers."""
 import argparse
 import json
 import math
@@ -29,6 +33,15 @@ SELECTION = "coo-package-split-v1"
 TOTALS = ("count", "reciprocalRankSum", "timeMs", "memoryBytes", "top1", "top2", "top3", "top10")
 # Observations whose target is ranked within the first k (Top-k accuracy, Recall@k).
 HITS = ("top1", "top2", "top3", "top10")
+KINDS = ("messages", "variables")
+PREFIXES = range(2, 9)
+# Longest benchmarks first (largest model, then the unvalidated, validated and hybrid
+# runs): the slowest work never starts last, and concurrent workers query the same
+# model at the same time, which Ollama batches.
+ORDER = tuple(strategy for size in ("7B", "3B", "15B", "05B")
+              for strategy in (f"llmUnvalidated{size}", f"llm{size}", f"hybrid{size}")) + (
+    "heuristicsBaseline", "heuristicsDependency")
+assert sorted(ORDER) == sorted(MEASURED)
 
 
 def atomic_json(path, value):
@@ -112,30 +125,28 @@ def prepare(run, image):
         if saved["inputs"] != inputs or saved["packages"] != packages:
             raise ValueError("Resume inputs changed (packages, image or worker scripts); use a new run")
         return saved
-    saved = dict(schema="coo-package-workers-v3", runId=uuid.uuid4().hex,
+    saved = dict(schema="coo-package-workers-v4", runId=uuid.uuid4().hex,
                  inputs=inputs, packages=packages)
     atomic_json(manifest, saved)
     return saved
 
 
 def row_keys():
-    return {(kind, strategy, prefix) for kind in ("messages", "variables")
-            for strategy in MEASURED for prefix in range(2, 9)}
+    return {(kind, strategy, prefix) for kind in KINDS
+            for strategy in MEASURED for prefix in PREFIXES}
 
 
-def validate_result(path, package, run_id):
-    result = read_json(path)
-    if (result.get("schema") != "coo-package-result-v3" or result.get("package") != package
-            or result.get("runId") != run_id):
-        raise ValueError(f"Wrong package or run identity: {path}")
-    corpus = result["corpus"]
+def check_corpus(corpus, path):
     if (set(corpus) != {"packages", "classes", "methods"} or corpus["packages"] != 1
             or any(type(n) is not int or n < 0 for n in corpus.values())):
         raise ValueError(f"Invalid corpus counts: {path}")
+
+
+def check_rows(rows, expected, path):
     seen = set()
-    for row in result["rows"]:
+    for row in rows:
         key = (row["kind"], row["strategy"], row["prefix"])
-        if key in seen or key not in row_keys() or type(row["prefix"]) is not int:
+        if key in seen or key not in expected or type(row["prefix"]) is not int:
             raise ValueError(f"Duplicate or unexpected measurement: {path}: {key}")
         seen.add(key)
         if type(row["count"]) is not int or row["count"] < 0:
@@ -157,13 +168,55 @@ def validate_result(path, package, run_id):
                     or not 0 <= valid <= generated <= 10 * row["count"]
                     or (row["strategy"] in LLM and valid != generated)):
                 raise ValueError(f"Invalid candidate counts: {path}: {key}")
-    if seen != row_keys():
+    if seen != expected:
         raise ValueError(f"Incomplete measurements: {path}")
+
+
+def validate_result(path, package, run_id):
+    result = read_json(path)
+    if (result.get("schema") != "coo-package-result-v3" or result.get("package") != package
+            or result.get("runId") != run_id):
+        raise ValueError(f"Wrong package or run identity: {path}")
+    check_corpus(result["corpus"], path)
+    check_rows(result["rows"], row_keys(), path)
     return result
+
+
+def validate_part(path, package, run_id, kind, strategy):
+    """One benchmark of a package: its seven prefix rows and the package corpus."""
+    part = read_json(path)
+    if (part.get("schema") != "coo-package-part-v1" or part.get("package") != package
+            or part.get("runId") != run_id or part.get("kind") != kind
+            or part.get("strategy") != strategy):
+        raise ValueError(f"Wrong package, benchmark or run identity: {path}")
+    check_corpus(part["corpus"], path)
+    check_rows(part["rows"], {(kind, strategy, prefix) for prefix in PREFIXES}, path)
+    return part
 
 
 def package_directory(run, index):
     return run / "packages" / f"{index + 1:04d}"
+
+
+def task_directory(run, index, kind, strategy):
+    return package_directory(run, index) / "benchmarks" / f"{kind}-{strategy}"
+
+
+def merge_parts(run, index, package, run_id):
+    """Combine a package's 28 benchmark parts into its checked result.json."""
+    parts = [read_json(task_directory(run, index, kind, strategy) / "part.json")
+             for kind in KINDS for strategy in MEASURED]
+    corpus = parts[0]["corpus"]
+    if any(part["corpus"] != corpus for part in parts):
+        raise ValueError(f"Benchmarks of {package} counted different corpora")
+    result = dict(schema="coo-package-result-v3", package=package, runId=run_id,
+                  corpus=corpus, rows=[row for part in parts for row in part["rows"]])
+    path = package_directory(run, index) / "result.json"
+    temporary = path.with_suffix(".pending.json")
+    atomic_json(temporary, result)
+    validate_result(temporary, package, run_id)
+    temporary.replace(path)
+    return path
 
 
 def copy_image(source, destination):
@@ -199,14 +252,16 @@ def stop_processes(active):
         log.close()
 
 
-def launch(image, directory, package, run_id, selection_path, code):
-    """Start one isolated Pharo worker; returns (process, log, pending result path)."""
+def launch(image, directory, package, kind, strategy, run_id, selection_path, code):
+    """Start one isolated Pharo worker for one benchmark of a package;
+    returns (process, log, pending part path)."""
     working = directory / "image"
     copy_image(image, working)
-    atomic_json(directory / "package.json", {"package": package})
-    temporary = directory / "result.pending.json"
+    atomic_json(directory.parent.parent / "package.json", {"package": package})
+    temporary = directory / "part.pending.json"
     temporary.unlink(missing_ok=True)
-    env = dict(os.environ, BENCHMARK_PACKAGE=package, BENCHMARK_RUN_ID=run_id,
+    env = dict(os.environ, BENCHMARK_PACKAGE=package, BENCHMARK_KIND=kind,
+               BENCHMARK_STRATEGY=strategy, BENCHMARK_RUN_ID=run_id,
                BENCHMARK_OUTPUT=str(temporary), BENCHMARK_RUN_SELECTION=str(selection_path))
     log = (directory / "worker.log").open("w")
     try:
@@ -224,7 +279,7 @@ def launch(image, directory, package, run_id, selection_path, code):
 PROGRESS = "Progress: "
 
 
-def report_progress(log, package, offset):
+def report_progress(log, label, offset):
     """Show the benchmarks a worker finished since offset; returns the new offset."""
     with open(log.name, errors="replace") as source:
         source.seek(offset)
@@ -234,33 +289,33 @@ def report_progress(log, package, offset):
                 return offset
             offset = source.tell()
             if line.startswith(PROGRESS):
-                print(f"  {package}: {line[len(PROGRESS):].strip()}", flush=True)
+                print(f"  {label}: {line[len(PROGRESS):].strip()}", flush=True)
 
 
-def execute(pending, jobs, start, finish):
-    """Keep at most `jobs` workers running, starting the next package as a slot frees.
+def execute(pending, jobs, start, finish, label=str):
+    """Keep at most `jobs` workers running, starting the next task as a slot frees.
 
-    start(index, package) -> (process, log, temporary);
-    finish(index, package, temporary, seconds) validates and keeps the result."""
+    start(task) -> (process, log, temporary);
+    finish(task, temporary, seconds) validates and keeps the result."""
     active = {}
     progress = {}
     try:
         while pending or active:
-            for index, (process, log, package, temporary, started) in list(active.items()):
+            for task, (process, log, temporary, started) in list(active.items()):
                 status = process.poll()
-                progress[index] = report_progress(log, package, progress.get(index, 0))
+                progress[task] = report_progress(log, label(task), progress.get(task, 0))
                 if status is None:
                     continue
                 log.close()
                 if status:
-                    raise RuntimeError(f"Benchmark failed for {package} (exit {status}); see {log.name}")
-                finish(index, package, temporary, time.monotonic() - started)
-                del active[index]
+                    raise RuntimeError(f"Benchmark failed for {label(task)} (exit {status}); see {log.name}")
+                finish(task, temporary, time.monotonic() - started)
+                del active[task]
             while pending and len(active) < jobs:
-                index, package = pending.pop(0)
-                process, log, temporary = start(index, package)
-                active[index] = (process, log, package, temporary, time.monotonic())
-                print(f"Started {package} ({len(active)}/{jobs} slots)", flush=True)
+                task = pending.pop(0)
+                process, log, temporary = start(task)
+                active[task] = (process, log, temporary, time.monotonic())
+                print(f"Started {label(task)} ({len(active)}/{jobs} slots)", flush=True)
             if active:
                 time.sleep(0.1)
     finally:
@@ -269,35 +324,70 @@ def execute(pending, jobs, start, finish):
 
 def run_workers(run, image, jobs):
     manifest = prepare(run, image)
+    run_id = manifest["runId"]
     total = len(manifest["packages"])
-    pending = []
+    # Benchmarks still to run, per package; a package is complete when none remain.
+    remaining = {}
     for index, package in enumerate(manifest["packages"]):
         result = package_directory(run, index) / "result.json"
         if result.exists():
-            validate_result(result, package, manifest["runId"])
+            validate_result(result, package, run_id)
             print(f"Reusing {package}", flush=True)
-        else:
-            pending.append((index, package))
-    done = [total - len(pending)]
+            continue
+        remaining[index] = set()
+        for kind in KINDS:
+            for strategy in MEASURED:
+                part = task_directory(run, index, kind, strategy) / "part.json"
+                if part.exists():
+                    validate_part(part, package, run_id, kind, strategy)
+                else:
+                    remaining[index].add((kind, strategy))
+        if not remaining[index]:
+            merge_parts(run, index, package, run_id)
+            del remaining[index]
+            print(f"Reusing {package} (all benchmarks were done)", flush=True)
+    pending = [(index, manifest["packages"][index], kind, strategy)
+               for strategy in ORDER for kind in KINDS
+               for index in sorted(remaining) if (kind, strategy) in remaining[index]]
+    done = [total - len(remaining)]
+    started = {}
     code = (SCRIPTS / "benchmark-package.st").read_text()
     # Record the user-selected cap for each invocation (including resumed runs).
     with (run / "worker-invocations.jsonl").open("a") as out:
         out.write(json.dumps(dict(jobs=jobs, pending=len(pending), time=time.time())) + "\n")
+    print(f"{len(pending)} benchmarks of {len(remaining)} packages to run, {jobs} at a time", flush=True)
 
-    def start(index, package):
-        return launch(image, package_directory(run, index), package,
-                      manifest["runId"], run / "selection.json", code)
+    def label(task):
+        _, package, kind, strategy = task
+        return f"{package} [{kind} {strategy}]"
 
-    def finish(index, package, temporary, seconds):
-        validate_result(temporary, package, manifest["runId"])
-        result = package_directory(run, index) / "result.json"
-        temporary.replace(result)
+    def start(task):
+        index, package, kind, strategy = task
+        started.setdefault(index, time.monotonic())
+        return launch(image, task_directory(run, index, kind, strategy), package, kind, strategy,
+                      run_id, run / "selection.json", code)
+
+    def finish(task, temporary, seconds):
+        index, package, kind, strategy = task
+        validate_part(temporary, package, run_id, kind, strategy)
+        directory = temporary.parent
+        temporary.replace(directory / "part.json")
+        # The part is kept; its private image copy is not needed any more.
+        shutil.rmtree(directory / "image", ignore_errors=True)
+        with (run / "task-timings.jsonl").open("a") as out:
+            out.write(json.dumps(dict(package=package, kind=kind, strategy=strategy,
+                                      seconds=seconds, jobs=jobs)) + "\n")
+        remaining[index].discard((kind, strategy))
+        if remaining[index]:
+            return
+        result = merge_parts(run, index, package, run_id)
+        elapsed = time.monotonic() - started.get(index, time.monotonic() - seconds)
         with (run / "timings.jsonl").open("a") as out:
-            out.write(json.dumps(dict(package=package, seconds=seconds, jobs=jobs)) + "\n")
+            out.write(json.dumps(dict(package=package, seconds=elapsed, jobs=jobs)) + "\n")
         done[0] += 1
-        print(f"Finished {package} in {seconds / 60:.1f} min ({done[0]}/{total} packages): {result}", flush=True)
+        print(f"Finished {package} in {elapsed / 60:.1f} min ({done[0]}/{total} packages): {result}", flush=True)
 
-    execute(pending, jobs, start, finish)
+    execute(pending, jobs, start, finish, label)
 
 
 def result_set(rows, name):

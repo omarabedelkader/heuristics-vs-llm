@@ -12,6 +12,11 @@ for option in "$@"; do
         --help|-h)
             echo "Usage: BENCHMARK_JOBS=N [BENCHMARK_PACKAGE_COUNT=N] $0"
             echo "Runs baseline, dependency, LLM completion and hybrid benchmarks on the saved benchmark packages."
+            echo "BENCHMARK_JOBS=N: benchmarks run at the same time. Every package is split into its 28 benchmarks"
+            echo "  (2 kinds x 14 strategies), each in its own Pharo process, so N slots stay busy even for one package."
+            echo "Ollama: the pipeline starts its own server on a free port with OLLAMA_NUM_PARALLEL=N"
+            echo "  (default BENCHMARK_JOBS) and OLLAMA_MAX_LOADED_MODELS (default 4)."
+            echo "  BENCHMARK_OLLAMA_HOST=host:port uses an existing server instead (start it with those settings)."
             echo "BENCHMARK_PACKAGE_COUNT=N: benchmark N seeded-random packages of the image (default 50; RANKING_SEED, default 42)."
             echo "BENCHMARK_PACKAGES_FILE=path: benchmark exactly these packages (one name per line, a JSON array, or a saved selection)."
             echo "BENCHMARK_REPO_DIR=path: the benchmark checkout (default ../HeuristicCompletion-Benchmarks-Multiples)."
@@ -54,43 +59,46 @@ prepare_run_directory
 "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" prepare \
     --run "$RUN_DIR" --image "$EXPERIMENT_DIR/image"
 
-# The Pharo client reads OLLAMA_HOST. Reuse an existing healthy server recent
-# enough to return log-probabilities, or start one that this pipeline owns and
-# cleans up on success or failure.
+# The benchmarks use their own Ollama server, on a free port next to any desktop
+# Ollama, started with one request slot per worker and every model kept loaded, so
+# the concurrent workers are served in parallel instead of queuing. This pipeline owns
+# it and stops it. BENCHMARK_OLLAMA_HOST=host:port uses that server instead (job.oar.sh
+# starts one with the same settings), or starts one there if nothing answers.
+# Either way the server must be recent enough to return log-probabilities.
 OLLAMA_MIN_VERSION="${OLLAMA_MIN_VERSION:-0.12.11}"
-OLLAMA_PORT="${OLLAMA_PORT:-11434}"
-OLLAMA_LOG="$RUN_DIR/ollama.log"
-OLLAMA_PID=""
 version_at_least() {
     [[ -n "$1" && "$(printf '%s\n%s\n' "$OLLAMA_MIN_VERSION" "$1" | sort -V | head -n1)" == "$OLLAMA_MIN_VERSION" ]]
 }
 server_version() {
-    curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:$1/api/version" 2>/dev/null \
+    curl -fsS --connect-timeout 2 --max-time 5 "$BENCHMARK_OLLAMA_URL/api/version" 2>/dev/null \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
 }
 binary_version() {
     # An unreachable host makes the binary report only its own (client) version.
     OLLAMA_HOST=127.0.0.1:1 "$1" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -n1 || true
 }
-server_usable() {
-    curl -fsS --connect-timeout 2 --max-time 5 \
-        "http://127.0.0.1:$1/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null \
-        && version_at_least "$(server_version "$1")"
-}
-if ! server_usable "$OLLAMA_PORT"; then
-    old_version="$(server_version "$OLLAMA_PORT")"
-    if [[ -n "$old_version" ]]; then
-        echo "Ollama $old_version at port $OLLAMA_PORT is older than $OLLAMA_MIN_VERSION" \
-            "(no log-probabilities); using port ${OLLAMA_FALLBACK_PORT:-11436} instead" >&2
-        OLLAMA_PORT="${OLLAMA_FALLBACK_PORT:-11436}"
-    fi
+if [[ -n "${BENCHMARK_OLLAMA_HOST:-}" ]]; then
+    export OLLAMA_HOST="$BENCHMARK_OLLAMA_HOST"
+else
+    export OLLAMA_HOST="127.0.0.1:$("$PIPELINE_PYTHON" -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])')"
 fi
-export OLLAMA_HOST="127.0.0.1:$OLLAMA_PORT"
-if ! server_usable "$OLLAMA_PORT"; then
-    if [[ -n "$(server_version "$OLLAMA_PORT")" ]]; then
-        echo "Ollama at $OLLAMA_HOST is older than $OLLAMA_MIN_VERSION; stop it or set OLLAMA_PORT" >&2
-        exit 1
-    fi
+export BENCHMARK_OLLAMA_URL="http://$OLLAMA_HOST"
+export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-$BENCHMARK_JOBS}"
+export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-4}"
+export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
+OLLAMA_LOG="$RUN_DIR/ollama.log"
+OLLAMA_PID=""
+if curl -fsS --connect-timeout 2 --max-time 5 \
+        "$BENCHMARK_OLLAMA_URL/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null \
+        && ! version_at_least "$(server_version)"; then
+    echo "Ollama $(server_version) at $OLLAMA_HOST is older than $OLLAMA_MIN_VERSION (no log-probabilities)" >&2
+    exit 1
+fi
+if ! curl -fsS --connect-timeout 2 --max-time 5 \
+        "$BENCHMARK_OLLAMA_URL/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null; then
     if [[ -z "${OLLAMA_BIN:-}" ]]; then
         # The first recent enough installation: PATH, a user-local one, or a previous download.
         for candidate in "$(command -v ollama || true)" "$HOME/.local/ollama/bin/ollama" \
@@ -135,7 +143,12 @@ if ! server_usable "$OLLAMA_PORT"; then
             fi
         fi
     fi
+    # Reuse the models a desktop Ollama already downloaded, instead of fetching them again.
+    if [[ -z "${OLLAMA_MODELS_DIR:-}" && -d "$HOME/.ollama/models" ]]; then
+        OLLAMA_MODELS_DIR="$HOME/.ollama/models"
+    fi
     export OLLAMA_MODELS="${OLLAMA_MODELS_DIR:-$SCRIPT_DIR/.ollama-models}"
+    echo "Starting Ollama at $OLLAMA_HOST: $OLLAMA_NUM_PARALLEL parallel requests, up to $OLLAMA_MAX_LOADED_MODELS models loaded"
     mkdir -p "$OLLAMA_MODELS"
     OLLAMA_MODELS="$(cd "$OLLAMA_MODELS" && pwd)"
     # Reuse models already pulled by a system Ollama (often read-only) through links,
@@ -158,7 +171,7 @@ if ! server_usable "$OLLAMA_PORT"; then
             exit 1
         fi
         if curl -fsS --connect-timeout 2 --max-time 5 \
-                "http://127.0.0.1:$OLLAMA_PORT/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null; then
+                "$BENCHMARK_OLLAMA_URL/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null; then
             ollama_ready=1
             break
         fi
@@ -168,12 +181,12 @@ if ! server_usable "$OLLAMA_PORT"; then
         echo "Ollama did not become ready; see $OLLAMA_LOG" >&2
         exit 1
     fi
-    if ! version_at_least "$(server_version "$OLLAMA_PORT")"; then
+    if ! version_at_least "$(server_version)"; then
         echo "$OLLAMA_BIN is older than Ollama $OLLAMA_MIN_VERSION (no log-probabilities)" >&2
         exit 1
     fi
 else
-    echo "Using the existing Ollama server at $OLLAMA_HOST"
+    echo "Using the existing Ollama server at $OLLAMA_HOST (start it with OLLAMA_NUM_PARALLEL and OLLAMA_MAX_LOADED_MODELS for parallel requests)"
 fi
 
 # Pull only missing models, using the exact names specified by the frozen source.

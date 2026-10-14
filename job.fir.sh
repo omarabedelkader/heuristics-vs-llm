@@ -37,8 +37,8 @@ module load StdEnv/2023 python/3.11
 # models and Pharo as it does on OAR. Models are kept between jobs (about 10 GB).
 export RUN_DIR="${RUN_DIR:-$ROOT_DIR/slurm-runs/${SLURM_JOB_ID:-manual-$(date '+%Y%m%d-%H%M%S')}}"
 export OLLAMA_MODELS_DIR="${OLLAMA_MODELS_DIR:-$ROOT_DIR/.ollama-models}"
-# 8 concurrent package jobs fit in the 12 CPU cores requested above.
-export BENCHMARK_JOBS="${BENCHMARK_JOBS:-8}"
+# One benchmark worker per CPU core requested above; Ollama gets as many request slots.
+export BENCHMARK_JOBS="${BENCHMARK_JOBS:-12}"
 
 echo "Slurm job ${SLURM_JOB_ID:-manual} on $(hostname), GPUs: ${CUDA_VISIBLE_DEVICES:-none}"
 exec bash "$ROOT_DIR/job.oar.sh" "$@"

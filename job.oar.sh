@@ -294,10 +294,21 @@ export OLLAMA_MODELS="$OLLAMA_MODELS_DIR"
 
 export OLLAMA_HOST="127.0.0.1:11434"
 
+# One request slot per benchmark worker, and all four models kept loaded: the
+# concurrent workers are served in parallel instead of queuing or reloading models.
+export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-$BENCHMARK_JOBS}"
+export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-${#OLLAMA_MODELS_TO_PULL[@]}}"
+export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
+
+# The pipeline uses this server instead of starting its own.
+export BENCHMARK_OLLAMA_HOST="$OLLAMA_HOST"
+
 
 log "OLLAMA_MODELS=$OLLAMA_MODELS"
 
 log "OLLAMA_HOST=$OLLAMA_HOST"
+
+log "OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL OLLAMA_MAX_LOADED_MODELS=$OLLAMA_MAX_LOADED_MODELS"
 
 
 log "2-CONFIGURE OLLAMA OK"
@@ -502,7 +513,7 @@ log "Available models:"
 log "============================================================"
 log "8. RUNNING BENCHMARKS"
 log "============================================================"
-log "Benchmark packages: $BENCHMARK_PACKAGE_COUNT; concurrent package jobs: $BENCHMARK_JOBS"
+log "Benchmark packages: $BENCHMARK_PACKAGE_COUNT; benchmarks running at the same time: $BENCHMARK_JOBS"
 log "Seed: $RANKING_SEED"
 log "Experiment: $EXPERIMENT_DIR"
 
