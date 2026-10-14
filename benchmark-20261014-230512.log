@@ -1,0 +1,32 @@
+Benchmark source: frozen from /home/oabedelk/heuristics-vs-llm/experiment/download.e7QErC
+Creating the experiment's Pharo image and installing the frozen benchmark source
+Downloading the latest 140 Image:
+    http://files.pharo.org/get-files/140/pharoImage-x86_64.zip
+Pharo.image
+Downloading the latest pharoVM:
+	http://files.pharo.org/get-files/140/pharo-vm-Linux-x86_64-stable.zip
+pharo-vm/pharo
+Creating starter scripts pharo and pharo-ui
+MetacelloNotification: Repository created for tonel:///home/oabedelk/heuristics-vs-llm/experiment/repository/src (0 seconds)
+MetacelloNotification: Loaded -> BaselineOfExtendedHeuristicCompletionBenchmarks --- unresolved (128 milliseconds)
+MetacelloNotification: Loading baseline of BaselineOfExtendedHeuristicCompletionBenchmarks...
+MetacelloNotification: Loaded -> ExtendedHeuristicCompletion-Benchmarks --- tonel:///home/oabedelk/heuristics-vs-llm/experiment/repository/src() (691 milliseconds)
+MetacelloNotification: ...finished to load the baseline (691 milliseconds)
+BaselineOfExtendedHeuristicCompletionBenchmarks [baseline] from tonel:///home/oabedelk/heuristics-vs-llm/experiment/repository/src
+Saved selection: 1 benchmark packages
+/home/oabedelk/heuristics-vs-llm/experiment/benchmark-selection.json
+StdioStream: #stdout
+Benchmark packages (saved): /home/oabedelk/heuristics-vs-llm/experiment/benchmark-selection.json
+Run directory: /home/oabedelk/heuristics-vs-llm/experiment/benchmark-run.XK9LCb
+Package concurrency selected by you: 1
+Ollama 0.9.0 at port 11434 is older than 0.12.11 (no log-probabilities); using port 11436 instead
+Ignoring /usr/local/bin/ollama 0.9.0, older than 0.12.11
+Starting Ollama 0.40.4 from /home/oabedelk/.local/ollama/bin/ollama at 127.0.0.1:11436
+Ollama model available: pharo-llm/Qwen2.5-Coder-SFT:0.5B
+Ollama model available: pharo-llm/Qwen2.5-Coder-SFT:1.5B
+Ollama model available: pharo-llm/Qwen2.5-Coder-SFT:3b
+Ollama model available: pharo-llm/Qwen2.5-Coder-SFT:7b
+Running baseline, dependency, LLM completion and hybrid benchmarks on the saved packages
+Started Network-Mail (1/1 slots)
+  Network-Mail: Methods - Baseline done in 1.2 min (1/28)
+  Network-Mail: Methods - Dependency done in 1.4 min (2/28)

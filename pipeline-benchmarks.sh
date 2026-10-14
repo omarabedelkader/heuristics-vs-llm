@@ -54,15 +54,55 @@ prepare_run_directory
 "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" prepare \
     --run "$RUN_DIR" --image "$EXPERIMENT_DIR/image"
 
-# The Pharo client uses localhost:11434. Reuse an existing healthy server, or
-# start a local one that this pipeline owns and cleans up on success or failure.
-export OLLAMA_HOST="127.0.0.1:11434"
+# The Pharo client reads OLLAMA_HOST. Reuse an existing healthy server recent
+# enough to return log-probabilities, or start one that this pipeline owns and
+# cleans up on success or failure.
+OLLAMA_MIN_VERSION="${OLLAMA_MIN_VERSION:-0.12.11}"
+OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 OLLAMA_LOG="$RUN_DIR/ollama.log"
 OLLAMA_PID=""
-if ! curl -fsS --connect-timeout 2 --max-time 5 \
-        http://127.0.0.1:11434/api/tags > "$RUN_DIR/ollama-tags.json" 2>/dev/null; then
+version_at_least() {
+    [[ -n "$1" && "$(printf '%s\n%s\n' "$OLLAMA_MIN_VERSION" "$1" | sort -V | head -n1)" == "$OLLAMA_MIN_VERSION" ]]
+}
+server_version() {
+    curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:$1/api/version" 2>/dev/null \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+}
+binary_version() {
+    # An unreachable host makes the binary report only its own (client) version.
+    OLLAMA_HOST=127.0.0.1:1 "$1" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -n1 || true
+}
+server_usable() {
+    curl -fsS --connect-timeout 2 --max-time 5 \
+        "http://127.0.0.1:$1/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null \
+        && version_at_least "$(server_version "$1")"
+}
+if ! server_usable "$OLLAMA_PORT"; then
+    old_version="$(server_version "$OLLAMA_PORT")"
+    if [[ -n "$old_version" ]]; then
+        echo "Ollama $old_version at port $OLLAMA_PORT is older than $OLLAMA_MIN_VERSION" \
+            "(no log-probabilities); using port ${OLLAMA_FALLBACK_PORT:-11436} instead" >&2
+        OLLAMA_PORT="${OLLAMA_FALLBACK_PORT:-11436}"
+    fi
+fi
+export OLLAMA_HOST="127.0.0.1:$OLLAMA_PORT"
+if ! server_usable "$OLLAMA_PORT"; then
+    if [[ -n "$(server_version "$OLLAMA_PORT")" ]]; then
+        echo "Ollama at $OLLAMA_HOST is older than $OLLAMA_MIN_VERSION; stop it or set OLLAMA_PORT" >&2
+        exit 1
+    fi
     if [[ -z "${OLLAMA_BIN:-}" ]]; then
-        OLLAMA_BIN="$(command -v ollama || true)"
+        # The first recent enough installation: PATH, a user-local one, or a previous download.
+        for candidate in "$(command -v ollama || true)" "$HOME/.local/ollama/bin/ollama" \
+                "$EXPERIMENT_DIR/ollama-bin/bin/ollama"; do
+            [[ -n "$candidate" && -x "$candidate" ]] || continue
+            if version_at_least "$(binary_version "$candidate")"; then
+                OLLAMA_BIN="$candidate"
+                echo "Starting Ollama $(binary_version "$OLLAMA_BIN") from $OLLAMA_BIN at $OLLAMA_HOST"
+                break
+            fi
+            echo "Ignoring $candidate $(binary_version "$candidate"), older than $OLLAMA_MIN_VERSION" >&2
+        done
     fi
     if [[ -z "$OLLAMA_BIN" ]]; then
         # Local installation, without sudo or system services (also works on OAR).
@@ -77,14 +117,18 @@ if ! curl -fsS --connect-timeout 2 --max-time 5 \
         esac
         ollama_install_dir="$EXPERIMENT_DIR/ollama-bin"
         OLLAMA_BIN="$ollama_install_dir/bin/ollama"
-        if [[ ! -x "$OLLAMA_BIN" ]]; then
+        if [[ ! -x "$OLLAMA_BIN" ]] || ! version_at_least "$(binary_version "$OLLAMA_BIN")"; then
+            rm -rf "$ollama_install_dir"
             mkdir -p "$ollama_install_dir"
             curl -fsSL "https://ollama.com/download/ollama-linux-$ollama_arch.tar.zst" \
                 -o "$ollama_install_dir/ollama.tar.zst"
-            if tar --help 2>/dev/null | grep -q zstd; then
-                tar --zstd -xf "$ollama_install_dir/ollama.tar.zst" -C "$ollama_install_dir"
-            elif command -v zstd >/dev/null 2>&1; then
+            if command -v zstd >/dev/null 2>&1; then
                 zstd -dc "$ollama_install_dir/ollama.tar.zst" | tar -xf - -C "$ollama_install_dir"
+            elif "$PIPELINE_PYTHON" -m pip install --quiet --target "$ollama_install_dir/python" zstandard; then
+                # tar --zstd also needs the zstd program; without it, decompress in Python.
+                PYTHONPATH="$ollama_install_dir/python" "$PIPELINE_PYTHON" -c \
+                    'import sys, zstandard; zstandard.ZstdDecompressor().copy_stream(sys.stdin.buffer, sys.stdout.buffer)' \
+                    < "$ollama_install_dir/ollama.tar.zst" | tar -xf - -C "$ollama_install_dir"
             else
                 echo "Extracting Ollama requires tar with zstd support or the zstd command." >&2
                 exit 1
@@ -94,6 +138,16 @@ if ! curl -fsS --connect-timeout 2 --max-time 5 \
     export OLLAMA_MODELS="${OLLAMA_MODELS_DIR:-$SCRIPT_DIR/.ollama-models}"
     mkdir -p "$OLLAMA_MODELS"
     OLLAMA_MODELS="$(cd "$OLLAMA_MODELS" && pwd)"
+    # Reuse models already pulled by a system Ollama (often read-only) through links,
+    # instead of downloading them again.
+    shared_models="${OLLAMA_SHARED_MODELS:-/usr/share/ollama/.ollama/models}"
+    if [[ -r "$shared_models/blobs" && -r "$shared_models/manifests" ]]; then
+        mkdir -p "$OLLAMA_MODELS/blobs"
+        for blob in "$shared_models"/blobs/*; do
+            [[ -r "$blob" && ! -e "$OLLAMA_MODELS/blobs/${blob##*/}" ]] && ln -s "$blob" "$OLLAMA_MODELS/blobs/"
+        done
+        cp -rn "$shared_models/manifests" "$OLLAMA_MODELS/" 2>/dev/null || true
+    fi
     "$OLLAMA_BIN" serve > "$OLLAMA_LOG" 2>&1 &
     OLLAMA_PID=$!
     CLEANUP_PIDS+=("$OLLAMA_PID")
@@ -104,7 +158,7 @@ if ! curl -fsS --connect-timeout 2 --max-time 5 \
             exit 1
         fi
         if curl -fsS --connect-timeout 2 --max-time 5 \
-                http://127.0.0.1:11434/api/tags > "$RUN_DIR/ollama-tags.json" 2>/dev/null; then
+                "http://127.0.0.1:$OLLAMA_PORT/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null; then
             ollama_ready=1
             break
         fi
@@ -112,6 +166,10 @@ if ! curl -fsS --connect-timeout 2 --max-time 5 \
     done
     if [[ -z "$ollama_ready" ]]; then
         echo "Ollama did not become ready; see $OLLAMA_LOG" >&2
+        exit 1
+    fi
+    if ! version_at_least "$(server_version "$OLLAMA_PORT")"; then
+        echo "$OLLAMA_BIN is older than Ollama $OLLAMA_MIN_VERSION (no log-probabilities)" >&2
         exit 1
     fi
 else

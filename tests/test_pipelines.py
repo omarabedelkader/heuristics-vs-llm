@@ -43,6 +43,11 @@ if 'http://127.0.0.1:11434/api/tags' in sys.argv:
         sys.exit(7)
     print(json.dumps({'models': [{'name': 'model-' + size} for size in ['05', '15', '3', '7']]}))
     sys.exit(0)
+if 'http://127.0.0.1:11434/api/version' in sys.argv:
+    if os.environ.get('TEST_START_OLLAMA') and not (root / 'ollama-ready').exists():
+        sys.exit(7)
+    print(json.dumps({'version': '0.40.4'}))
+    sys.exit(0)
 url = next(arg for arg in sys.argv if arg.startswith('http'))
 with (root / 'downloads').open('a') as out:
     out.write(url + ' ' + str(Path.cwd()) + '\\n')

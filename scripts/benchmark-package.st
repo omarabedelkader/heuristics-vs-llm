@@ -1,7 +1,12 @@
 "Run one benchmark package and retain sufficient statistics, without rounding.
 LLM completion runs twice: before Pharo validation (the candidates are what the model
 generates, real names or not) and after it (only real names of the image)."
-| selection packageName package strategies unvalidated labelFor kinds results done rows output |
+| selection packageName package strategies unvalidated labelFor kinds results done rows output ollamaHost |
+"The pipeline picks an Ollama server recent enough for log-probabilities; use it."
+ollamaHost := OSEnvironment current at: 'OLLAMA_HOST' ifAbsent: [ nil ].
+ollamaHost ifNotNil: [
+    CooLLMClient default baseUrl: ((ollamaHost includesSubstring: '://')
+        ifTrue: [ ollamaHost ] ifFalse: [ 'http://' , ollamaHost ]) ].
 selection := STONJSON fromString: (OSEnvironment current at: 'BENCHMARK_RUN_SELECTION') asFileReference contents.
 (selection at: 'schema') = 'coo-package-split-v1' ifFalse: [ Error signal: 'Saved benchmark selection required' ].
 (selection at: 'eligible') asSet = CooBenchRunner eligiblePackageNames asSet ifFalse: [
