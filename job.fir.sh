@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # Slurm job for the Fir cluster (Digital Research Alliance of Canada).
-# It runs the same benchmarks as job.oar.sh, on one NVIDIA H100 (80 GB) GPU.
+# It runs the same benchmarks as job.oar.sh, on a 40 GB slice (MIG 3g.40gb) of an
+# NVIDIA H100: the largest model (7b) fits, and slices start sooner than full GPUs.
 #
 # Submit it from the repository directory on Fir:
 #     cd ~/projects/def-YOURPI/heuristics-vs-llm
@@ -11,10 +12,10 @@
 # Cancel it:   scancel <jobid>
 
 #SBATCH --job-name=heuristic-completion-benchmark
-#SBATCH --gpus-per-node=h100:1
+#SBATCH --gpus-per-node=nvidia_h100_80gb_hbm3_3g.40gb:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=64G
-#SBATCH --time=1-00:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=heuristic-completion.%j.out
 #SBATCH --error=heuristic-completion.%j.err
 
