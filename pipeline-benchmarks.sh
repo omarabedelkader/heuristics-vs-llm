@@ -161,7 +161,9 @@ if ! curl -fsS --connect-timeout 2 --max-time 5 \
         done
         cp -rn "$shared_models/manifests" "$OLLAMA_MODELS/" 2>/dev/null || true
     fi
-    "$OLLAMA_BIN" serve > "$OLLAMA_LOG" 2>&1 &
+    # Filtered and capped (OLLAMA_LOG_MAX_MB): unfiltered, it grows by gigabytes per hour.
+    "$OLLAMA_BIN" serve > >(awk -v limit_mb="${OLLAMA_LOG_MAX_MB:-200}" \
+        -f "$SCRIPT_DIR/scripts/ollama-log-filter.awk" > "$OLLAMA_LOG") 2>&1 &
     OLLAMA_PID=$!
     CLEANUP_PIDS+=("$OLLAMA_PID")
     ollama_ready=""

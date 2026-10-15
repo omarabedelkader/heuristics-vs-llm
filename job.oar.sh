@@ -323,7 +323,10 @@ log "3. STARTING OLLAMA SERVER"
 log "============================================================"
 
 
-"$OLLAMA_BIN" serve > "$OLLAMA_LOG" 2>&1 &
+# Per-request runner lines are filtered out and the log is capped (OLLAMA_LOG_MAX_MB),
+# so a long run cannot fill the disk quota with it.
+"$OLLAMA_BIN" serve > >(awk -v limit_mb="${OLLAMA_LOG_MAX_MB:-200}" \
+    -f "$ROOT_DIR/scripts/ollama-log-filter.awk" > "$OLLAMA_LOG") 2>&1 &
 
 OLLAMA_PID=$!
 

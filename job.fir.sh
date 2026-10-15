@@ -18,6 +18,9 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=heuristic-completion.%j.out
 #SBATCH --error=heuristic-completion.%j.err
+# Email when the job starts, ends, fails or reaches 80% of its time limit. Give the
+# address at submission: sbatch --mail-user=you@example.com ...
+#SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT_80
 
 set -euo pipefail
 
@@ -34,8 +37,12 @@ module purge
 module load StdEnv/2023 python/3.11
 
 # Fir compute nodes have internet access, so job.oar.sh can download Ollama, the
-# models and Pharo as it does on OAR. Models are kept between jobs (about 10 GB).
-export RUN_DIR="${RUN_DIR:-$ROOT_DIR/slurm-runs/${SLURM_JOB_ID:-manual-$(date '+%Y%m%d-%H%M%S')}}"
+# models and Pharo as it does on OAR. Models are kept between jobs (about 25 GB).
+# Runs go to /scratch when there is one: /home has a 50 GB quota, too small for a
+# 250-package run next to the models. Scratch files unused for 60 days are purged,
+# so copy the results you keep.
+RUNS_BASE="${SCRATCH:+$SCRATCH/heuristics-vs-llm}"
+export RUN_DIR="${RUN_DIR:-${RUNS_BASE:-$ROOT_DIR}/slurm-runs/${SLURM_JOB_ID:-manual-$(date '+%Y%m%d-%H%M%S')}}"
 export OLLAMA_MODELS_DIR="${OLLAMA_MODELS_DIR:-$ROOT_DIR/.ollama-models}"
 # One benchmark worker per CPU core requested above; Ollama gets as many request slots.
 export BENCHMARK_JOBS="${BENCHMARK_JOBS:-12}"
