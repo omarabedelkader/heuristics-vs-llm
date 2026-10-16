@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 #OAR -q default
-#OAR -p chirop
-#OAR -l host=1,walltime=14:00:00
+#OAR -p larochette
+#OAR -l host=1,walltime=62:00:00
 #OAR -n heuristic-completion-benchmark
 #OAR -O heuristic-completion.%jobid%.out
 #OAR -E heuristic-completion.%jobid%.err
@@ -163,9 +163,22 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 
     nvidia-smi || true
 
+elif [ -e /dev/kfd ]; then
+
+    # larochette: 4 x AMD Instinct MI210 (64 GiB each)
+    log "AMD GPU detected (/dev/kfd)"
+
+    if command -v rocm-smi >/dev/null 2>&1; then
+        rocm-smi || true
+    elif command -v amd-smi >/dev/null 2>&1; then
+        amd-smi list || true
+    else
+        ls -l /dev/kfd /dev/dri || true
+    fi
+
 else
 
-    log "No NVIDIA GPU detected"
+    log "No GPU detected"
 
 fi
 
@@ -225,25 +238,32 @@ curl -fL \
 log "Extracting Ollama"
 
 
-if tar --help 2>/dev/null | grep -q zstd; then
+extract_zst() {
 
-    tar --zstd -xf "$OLLAMA_ARCHIVE"
+    if tar --help 2>/dev/null | grep -q zstd; then
 
-elif command -v unzstd >/dev/null 2>&1; then
+        tar --zstd -xf "$1"
 
-    unzstd -c "$OLLAMA_ARCHIVE" | tar -xf -
+    elif command -v unzstd >/dev/null 2>&1; then
 
-elif command -v zstd >/dev/null 2>&1; then
+        unzstd -c "$1" | tar -xf -
 
-    zstd -dc "$OLLAMA_ARCHIVE" | tar -xf -
+    elif command -v zstd >/dev/null 2>&1; then
 
-else
+        zstd -dc "$1" | tar -xf -
 
-    log "ERROR: Cannot extract Ollama."
-    log "zstd support was not found."
-    exit 1
+    else
 
-fi
+        log "ERROR: Cannot extract Ollama."
+        log "zstd support was not found."
+        exit 1
+
+    fi
+
+}
+
+
+extract_zst "$OLLAMA_ARCHIVE"
 
 
 ###############################################################################
@@ -278,6 +298,42 @@ log "$OLLAMA_BIN"
 "$OLLAMA_BIN" --version || true
 
 
+###############################################################################
+# AMD GPUs: ROCm libraries of the same Ollama release
+#
+# The archive above only runs on NVIDIA GPUs or on the CPU. On an AMD node
+# (larochette: 4 x Instinct MI210) Ollama also needs its ROCm add-on, extracted
+# into the same directory; without it every model silently runs on the CPU.
+###############################################################################
+
+if [ -e /dev/kfd ]; then
+
+    # An unreachable host makes the binary report only its own (client) version.
+    OLLAMA_VERSION="$(OLLAMA_HOST=127.0.0.1:1 "$OLLAMA_BIN" --version 2>&1 \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -n 1 || true)"
+
+    OLLAMA_ROCM_ARCHIVE="ollama-linux-${OLLAMA_ARCH}-rocm.tar.zst"
+
+    log "AMD GPU found: downloading $OLLAMA_ROCM_ARCHIVE (Ollama ${OLLAMA_VERSION:-latest})"
+
+    if curl -fL --retry 5 --retry-delay 10 \
+        "https://ollama.com/download/$OLLAMA_ROCM_ARCHIVE${OLLAMA_VERSION:+?version=$OLLAMA_VERSION}" \
+        -o "$OLLAMA_ROCM_ARCHIVE"; then
+
+        extract_zst "$OLLAMA_ROCM_ARCHIVE"
+        rm -f "$OLLAMA_ROCM_ARCHIVE"
+
+        log "ROCm libraries installed"
+
+    else
+
+        log "WARNING: ROCm download failed: the models will run on the CPU"
+
+    fi
+
+fi
+
+
 log "1-INSTALL OLLAMA OK"
 
 
@@ -299,6 +355,11 @@ export OLLAMA_HOST="127.0.0.1:11434"
 export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-$BENCHMARK_JOBS}"
 export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-${#OLLAMA_MODELS_TO_PULL[@]}}"
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
+# The benchmark requests set no num_ctx. Without a GPU Ollama answers them with a
+# 4096-token context; with 64 GiB GPUs recent versions pick a far larger default,
+# whose cache for 8 parallel slots would push the models out of GPU memory.
+# 4096 keeps the requests exactly as on the CPU nodes.
+export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-4096}"
 
 # The pipeline uses this server instead of starting its own.
 export BENCHMARK_OLLAMA_HOST="$OLLAMA_HOST"
@@ -309,6 +370,8 @@ log "OLLAMA_MODELS=$OLLAMA_MODELS"
 log "OLLAMA_HOST=$OLLAMA_HOST"
 
 log "OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL OLLAMA_MAX_LOADED_MODELS=$OLLAMA_MAX_LOADED_MODELS"
+
+log "OLLAMA_CONTEXT_LENGTH=$OLLAMA_CONTEXT_LENGTH"
 
 
 log "2-CONFIGURE OLLAMA OK"
@@ -394,6 +457,30 @@ if [ "$OLLAMA_READY" -ne 1 ]; then
     echo "============================================="
 
     exit 1
+
+fi
+
+
+# On a GPU node, Ollama reports each GPU it will use ("inference compute") once it
+# has discovered them, shortly after it starts answering.
+if [ -e /dev/kfd ] || command -v nvidia-smi >/dev/null 2>&1; then
+
+    for i in $(seq 1 120); do
+        grep -q 'inference compute' "$OLLAMA_LOG" 2>/dev/null && break
+        sleep 1
+    done
+
+    if grep 'inference compute' "$OLLAMA_LOG" | grep -iE 'library=(rocm|cuda|vulkan)' >/dev/null; then
+
+        log "Ollama uses these GPUs:"
+        grep 'inference compute' "$OLLAMA_LOG" || true
+
+    else
+
+        log "WARNING: Ollama found no GPU: the models run on the CPU (much slower)"
+        grep -iE 'inference compute|gpu|rocm|amdgpu' "$OLLAMA_LOG" | head -n 30 || true
+
+    fi
 
 fi
 
