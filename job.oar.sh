@@ -2,7 +2,7 @@
 
 #OAR -q default
 #OAR -p larochette
-#OAR -l host=1,walltime=62:00:00
+#OAR -l host=1,walltime=55:00:00
 #OAR -n heuristic-completion-benchmark
 #OAR -O heuristic-completion.%jobid%.out
 #OAR -E heuristic-completion.%jobid%.err
@@ -30,7 +30,7 @@ export EXPERIMENT_DIR="$RUN_DIR"
 export RESULTS_DIR="$RUN_DIR/results"
 # Edit these two defaults to choose the total benchmark packages and concurrency.
 # Environment variables supplied at submission time override these defaults.
-export BENCHMARK_PACKAGE_COUNT="${BENCHMARK_PACKAGE_COUNT:-250}"
+export BENCHMARK_PACKAGE_COUNT="${BENCHMARK_PACKAGE_COUNT:-50}"
 export BENCHMARK_JOBS="${BENCHMARK_JOBS:-8}"
 for setting in BENCHMARK_PACKAGE_COUNT BENCHMARK_JOBS; do
     if [[ ! "${!setting}" =~ ^[1-9][0-9]*$ ]]; then
@@ -50,6 +50,20 @@ OLLAMA_INSTALL_DIR="$RUN_DIR/ollama-bin"
 OLLAMA_MODELS_DIR="${OLLAMA_MODELS_DIR:-$ROOT_DIR/.ollama-models}"
 
 OLLAMA_LOG="$RUN_DIR/ollama.log"
+
+# BENCHMARK_SHARED=1: this job is one of several hosts sharing the benchmarks of one
+# resumed run (submit-shared.sh). Each host has its own Ollama log, and all of them
+# reuse the Ollama installation already in RUN_DIR instead of extracting it at once.
+OLLAMA_REUSE=""
+if [[ -n "${BENCHMARK_SHARED:-}" ]]; then
+    OLLAMA_LOG="$RUN_DIR/ollama.$(hostname -s).log"
+    if [[ -x "$OLLAMA_INSTALL_DIR/bin/ollama" ]] &&
+            { [[ ! -e /dev/kfd ]] || compgen -G "$OLLAMA_INSTALL_DIR/lib/ollama/rocm*" >/dev/null; }; then
+        OLLAMA_REUSE=1
+    else
+        OLLAMA_INSTALL_DIR="$RUN_DIR/ollama-bin-$(hostname -s)"
+    fi
+fi
 OLLAMA_PID=""
 PIPELINE_PID=""
 
@@ -223,19 +237,21 @@ esac
 OLLAMA_ARCHIVE="ollama-linux-${OLLAMA_ARCH}.tar.zst"
 
 log "Architecture: $ARCH"
-log "Downloading Ollama: $OLLAMA_ARCHIVE"
-
-
-curl -fL \
-    "https://ollama.com/download/$OLLAMA_ARCHIVE" \
-    -o "$OLLAMA_ARCHIVE"
+if [[ -n "$OLLAMA_REUSE" ]]; then
+    log "Reusing the Ollama installation of this run: $OLLAMA_INSTALL_DIR"
+else
+    log "Downloading Ollama: $OLLAMA_ARCHIVE"
+    curl -fL \
+        "https://ollama.com/download/$OLLAMA_ARCHIVE" \
+        -o "$OLLAMA_ARCHIVE"
+fi
 
 
 ###############################################################################
 # Extract Ollama
 ###############################################################################
 
-log "Extracting Ollama"
+[[ -n "$OLLAMA_REUSE" ]] || log "Extracting Ollama"
 
 
 extract_zst() {
@@ -263,7 +279,7 @@ extract_zst() {
 }
 
 
-extract_zst "$OLLAMA_ARCHIVE"
+[[ -n "$OLLAMA_REUSE" ]] || extract_zst "$OLLAMA_ARCHIVE"
 
 
 ###############################################################################
@@ -306,7 +322,7 @@ log "$OLLAMA_BIN"
 # into the same directory; without it every model silently runs on the CPU.
 ###############################################################################
 
-if [ -e /dev/kfd ]; then
+if [ -e /dev/kfd ] && [[ -z "$OLLAMA_REUSE" ]]; then
 
     # An unreachable host makes the binary report only its own (client) version.
     OLLAMA_VERSION="$(OLLAMA_HOST=127.0.0.1:1 "$OLLAMA_BIN" --version 2>&1 \
@@ -347,6 +363,8 @@ log "============================================================"
 
 
 export OLLAMA_MODELS="$OLLAMA_MODELS_DIR"
+# The model directory may be shared by several jobs: never let one delete blobs.
+export OLLAMA_NOPRUNE=1
 
 export OLLAMA_HOST="127.0.0.1:11434"
 
@@ -594,6 +612,24 @@ log "Ollama is running"
 log "Available models:"
 
 "$OLLAMA_BIN" list
+
+
+# Load every model into GPU memory now: a cold load of the 7B model from NFS
+# takes longer than the benchmark client's 120 s HTTP timeout.
+for model in "${OLLAMA_MODELS_TO_PULL[@]}"; do
+    log "Loading model into memory: $model"
+    if ! curl -fsS --max-time 1800 http://127.0.0.1:11434/api/generate \
+        -d "{\"model\": \"$model\", \"prompt\": \"\", \"keep_alive\": -1}" \
+        >/dev/null; then
+        log "ERROR: Failed to load model: $model"
+        tail -50 "$OLLAMA_LOG" || true
+        exit 1
+    fi
+done
+
+log "Loaded models:"
+
+"$OLLAMA_BIN" ps
 
 
 ###############################################################################

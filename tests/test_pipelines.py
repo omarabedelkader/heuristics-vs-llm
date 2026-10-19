@@ -33,7 +33,8 @@ class PipelineTests(unittest.TestCase):
                     "BENCHMARK_OLLAMA_HOST": "127.0.0.1:11434",
                     "RESULTS_DIR": str(self.root / "resutls"),
                     "TEST_ROOT": str(self.root), "PATH": str(binaries) + os.pathsep + os.environ['PATH']}
-        for name in ("MINING_DIR", "PIPELINE_PYTHON", "BENCHMARK_PACKAGES_FILE", "BENCHMARK_RESUME_DIR"):
+        for name in ("MINING_DIR", "PIPELINE_PYTHON", "BENCHMARK_PACKAGES_FILE", "BENCHMARK_RESUME_DIR",
+                     "BENCHMARK_SHARED"):
             self.env.pop(name, None)
         self.executable(binaries / 'curl', '''
 import json, os, sys
@@ -171,7 +172,7 @@ time.sleep(30)
         return sorted(self.experiment.glob('benchmark-run.*'))
 
     def test_only_the_benchmark_and_cluster_entry_points_remain(self):
-        self.assertEqual(sorted(p.name for p in ROOT.glob('*.sh')), ['job.fir.sh', 'job.oar.sh', 'pipeline-benchmarks.sh'])
+        self.assertEqual(sorted(p.name for p in ROOT.glob('*.sh')), ['job.fir.sh', 'job.oar.sh', 'pipeline-benchmarks.sh', 'submit-shared.sh'])
         for name in ('ranking_corpus.py', 'reranker_workflow.py', 'download_snapshot.py', 'runtime_estimate.py'):
             self.assertFalse((ROOT / 'scripts' / name).exists(), name)
 
@@ -398,6 +399,41 @@ time.sleep(30)
         self.assertEqual(len(list(run.glob('packages/*/result.json'))), 3)
         self.assertEqual(self.runs(), [run])
         self.assertTrue((self.root / 'benchmark-complete').exists())
+
+    def test_hosts_sharing_a_resumed_run_finish_it_once(self):
+        self.env['BENCHMARK_PACKAGE_COUNT'] = '3'
+        self.env['BENCHMARK_JOBS'] = '1'
+        self.run_pipeline()
+        failing = json.loads((self.experiment / 'benchmark-selection.json').read_text())['benchmark'][1]
+        shutil.rmtree(self.runs()[0])
+        (self.root / 'benchmark-complete').unlink()
+        self.env['TEST_FAIL_PACKAGE'] = failing
+        self.run_pipeline(1)
+        run, = self.runs()
+        done = len(list(run.glob('packages/*/benchmarks/*/part.json')))
+        self.env.pop('TEST_FAIL_PACKAGE')
+        # A job killed at its walltime leaves its locks behind.
+        (self.experiment / '.running').mkdir()
+        (self.root / 'pharo-calls.jsonl').unlink()
+        env = dict(self.env, BENCHMARK_SHARED='1', BENCHMARK_RESUME_DIR=str(run))
+        hosts = [subprocess.Popen(["bash", str(ROOT / 'pipeline-benchmarks.sh'), '--foreground'], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                 for _ in range(2)]
+        for host in hosts:
+            output, _ = host.communicate(timeout=60)
+            self.assertEqual(host.returncode, 0, output)
+        (self.experiment / '.running').rmdir()
+        self.assertFalse((self.root / 'resutls/.running').exists())
+        # Between them, the hosts run each unfinished benchmark exactly once.
+        self.assertEqual(len(self.calls('coo-package-part-v1')), 3 * 28 - done)
+        self.assertEqual(len(list(run.glob('packages/*/result.json'))), 3)
+        self.assertEqual(self.runs(), [run])
+        self.assertTrue((self.root / 'benchmark-complete').exists())
+
+    def test_shared_hosts_need_a_run_to_resume(self):
+        self.env['BENCHMARK_SHARED'] = '1'
+        result = self.run_pipeline(1)
+        self.assertIn('BENCHMARK_SHARED needs BENCHMARK_RESUME_DIR', result.stderr)
 
     def test_resume_directory_must_be_a_prepared_run_of_this_experiment(self):
         self.run_pipeline()

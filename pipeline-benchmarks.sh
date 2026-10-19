@@ -90,15 +90,17 @@ export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-$BENCHMARK_JOBS}"
 export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-4}"
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
 OLLAMA_LOG="$RUN_DIR/ollama.log"
+# Hosts sharing a run (BENCHMARK_SHARED) each query their own server.
+OLLAMA_TAGS="$RUN_DIR/ollama-tags${BENCHMARK_SHARED:+.$(hostname -s)}.json"
 OLLAMA_PID=""
 if curl -fsS --connect-timeout 2 --max-time 5 \
-        "$BENCHMARK_OLLAMA_URL/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null \
+        "$BENCHMARK_OLLAMA_URL/api/tags" > "$OLLAMA_TAGS" 2>/dev/null \
         && ! version_at_least "$(server_version)"; then
     echo "Ollama $(server_version) at $OLLAMA_HOST is older than $OLLAMA_MIN_VERSION (no log-probabilities)" >&2
     exit 1
 fi
 if ! curl -fsS --connect-timeout 2 --max-time 5 \
-        "$BENCHMARK_OLLAMA_URL/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null; then
+        "$BENCHMARK_OLLAMA_URL/api/tags" > "$OLLAMA_TAGS" 2>/dev/null; then
     if [[ -z "${OLLAMA_BIN:-}" ]]; then
         # The first recent enough installation: PATH, a user-local one, or a previous download.
         for candidate in "$(command -v ollama || true)" "$HOME/.local/ollama/bin/ollama" \
@@ -173,7 +175,7 @@ if ! curl -fsS --connect-timeout 2 --max-time 5 \
             exit 1
         fi
         if curl -fsS --connect-timeout 2 --max-time 5 \
-                "$BENCHMARK_OLLAMA_URL/api/tags" > "$RUN_DIR/ollama-tags.json" 2>/dev/null; then
+                "$BENCHMARK_OLLAMA_URL/api/tags" > "$OLLAMA_TAGS" 2>/dev/null; then
             ollama_ready=1
             break
         fi
@@ -193,7 +195,7 @@ fi
 
 # Pull only missing models, using the exact names specified by the frozen source.
 "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/ollama_models.py" \
-    "$EXPERIMENT_DIR/llm-models.json" "$RUN_DIR/ollama-tags.json"
+    "$EXPERIMENT_DIR/llm-models.json" "$OLLAMA_TAGS"
 
 echo "Running baseline, dependency, LLM completion and hybrid benchmarks on the saved packages"
 run_packages

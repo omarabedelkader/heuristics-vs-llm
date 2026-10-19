@@ -21,7 +21,8 @@ class OarJobTests(unittest.TestCase):
         binaries.mkdir()
         self.env = {**os.environ, 'TEST_ROOT': str(self.root), 'OAR_JOB_ID': '123',
                     'PATH': str(binaries) + os.pathsep + os.environ['PATH']}
-        for key in ('RUN_DIR', 'BENCHMARK_PACKAGE_COUNT', 'BENCHMARK_JOBS', 'OLLAMA_MODELS_DIR'):
+        for key in ('RUN_DIR', 'BENCHMARK_PACKAGE_COUNT', 'BENCHMARK_JOBS', 'OLLAMA_MODELS_DIR',
+                    'BENCHMARK_SHARED'):
             self.env.pop(key, None)
         self.executable(binaries / 'curl', '''
 import os,sys
@@ -84,7 +85,7 @@ sys.exit(int(os.environ.get('TEST_PIPELINE_STATUS','0')))
     def test_original_model_downloads_and_new_pipeline_defaults(self):
         self.run_job('--help')
         invocation = json.loads((self.root / 'invocation.json').read_text())
-        self.assertEqual(invocation['env']['BENCHMARK_PACKAGE_COUNT'], '250')
+        self.assertEqual(invocation['env']['BENCHMARK_PACKAGE_COUNT'], '50')
         self.assertEqual(invocation['env']['BENCHMARK_JOBS'], '8')
         self.assertEqual(invocation['args'], ['--foreground', '--help'])
         self.assertEqual(invocation['env']['RESULTS_DIR'], str(self.root / 'oar-runs/123/results'))
@@ -99,6 +100,21 @@ sys.exit(int(os.environ.get('TEST_PIPELINE_STATUS','0')))
         invocation = json.loads((self.root / 'invocation.json').read_text())
         self.assertEqual(invocation['env']['BENCHMARK_PACKAGE_COUNT'], '100')
         self.assertEqual(invocation['env']['BENCHMARK_JOBS'], '3')
+
+    def test_shared_hosts_reuse_the_run_installation_and_log_apart(self):
+        if Path('/dev/kfd').exists():
+            self.skipTest('the reuse check also needs the ROCm libraries on an AMD node')
+        installation = self.root / 'oar-runs/run/ollama-bin/bin'
+        installation.mkdir(parents=True)
+        shutil.copy2(self.root / 'fake-ollama', installation / 'ollama')
+        self.env.update(BENCHMARK_SHARED='1', RUN_DIR=str(self.root / 'oar-runs/run'))
+        self.run_job()
+        self.assertFalse((self.root / 'ollama-download').exists())
+        invocation = json.loads((self.root / 'invocation.json').read_text())
+        self.assertEqual(invocation['env']['OLLAMA_BIN'], str(installation / 'ollama'))
+        host = subprocess.run(['hostname', '-s'], capture_output=True, text=True).stdout.strip()
+        self.assertTrue((self.root / f'oar-runs/run/ollama.{host}.log').exists())
+        self.assertFalse((self.root / 'oar-runs/run/ollama.log').exists())
 
     def test_bad_counts_fail_before_downloads(self):
         for key in ('BENCHMARK_PACKAGE_COUNT', 'BENCHMARK_JOBS'):

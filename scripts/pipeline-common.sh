@@ -39,10 +39,25 @@ RESULTS_LOCKED=""
 CLEANUP_PIDS=()
 
 # One pipeline at a time per experiment: concurrent runs would share CPUs and distort
-# the latency and memory measurements of both.
-if ! mkdir "$EXPERIMENT_DIR/.running" 2>/dev/null; then
+# the latency and memory measurements of both. BENCHMARK_SHARED=1 is the exception:
+# one pipeline per host (each its own CPUs and Ollama), sharing the benchmarks of one
+# resumed run directory (scripts/shared_run.py).
+BENCHMARK_SHARED="${BENCHMARK_SHARED:-}"
+EXPERIMENT_LOCKED=""
+if [[ -n "$BENCHMARK_SHARED" ]]; then
+    if [[ -z "${BENCHMARK_RESUME_DIR:-}" ]]; then
+        echo "BENCHMARK_SHARED needs BENCHMARK_RESUME_DIR: the run directory the hosts share." >&2
+        exit 1
+    fi
+    if [[ -d "$EXPERIMENT_DIR/.running" ]]; then
+        echo "Warning: $EXPERIMENT_DIR/.running exists; ignored with BENCHMARK_SHARED" \
+             "(make sure no single-host pipeline runs this experiment)." >&2
+    fi
+elif ! mkdir "$EXPERIMENT_DIR/.running" 2>/dev/null; then
     echo "Experiment is already running: $EXPERIMENT_DIR (.running lock)" >&2
     exit 1
+else
+    EXPERIMENT_LOCKED=1
 fi
 pipeline_cleanup() {
     local pid
@@ -54,16 +69,21 @@ pipeline_cleanup() {
     if [[ -n "$RESULTS_LOCKED" ]]; then
         rmdir "$RESULTS_DIR/.running"
     fi
-    rmdir "$EXPERIMENT_DIR/.running"
+    if [[ -n "$EXPERIMENT_LOCKED" ]]; then
+        rmdir "$EXPERIMENT_DIR/.running"
+    fi
 }
 trap pipeline_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if ! mkdir "$RESULTS_DIR/.running" 2>/dev/null; then
-    echo "Results directory is already in use: $RESULTS_DIR" >&2
-    exit 1
+# Shared hosts take this lock only to publish (publish_results).
+if [[ -z "$BENCHMARK_SHARED" ]]; then
+    if ! mkdir "$RESULTS_DIR/.running" 2>/dev/null; then
+        echo "Results directory is already in use: $RESULTS_DIR" >&2
+        exit 1
+    fi
+    RESULTS_LOCKED=1
 fi
-RESULTS_LOCKED=1
 
 # The experiment's source is a frozen copy of the local checkout (or, without one, of
 # the GitHub revision BENCHMARK_REF). When the code changes in the checkout, the copy
@@ -78,7 +98,14 @@ if [[ ! -d "$REPO_DIR" && ( -e "$EXPERIMENT_DIR/image" || -f "$BENCHMARK_SELECTI
     echo "Frozen benchmark source is missing; restore it or use a new EXPERIMENT_DIR." >&2
     exit 1
 fi
-if [[ -d "$BENCHMARK_CHECKOUT/src" || -d "$REPO_DIR" || -n "${BENCHMARK_REPO_DIR:-}" ]]; then
+if [[ -n "$BENCHMARK_SHARED" ]]; then
+    # Shared hosts resume the run with the frozen source as it is: one host changing it
+    # would change the image under the benchmarks of the others.
+    if [[ ! -d "$REPO_DIR" ]]; then
+        echo "BENCHMARK_SHARED: the experiment has no frozen source: $REPO_DIR" >&2
+        exit 1
+    fi
+elif [[ -d "$BENCHMARK_CHECKOUT/src" || -d "$REPO_DIR" || -n "${BENCHMARK_REPO_DIR:-}" ]]; then
     benchmark_source sync --checkout "$BENCHMARK_CHECKOUT"
 else
     BENCHMARK_REF="${BENCHMARK_REF:-main}"
@@ -121,6 +148,10 @@ image_status=0
 benchmark_source check-image --image "$EXPERIMENT_DIR/image/Pharo.image" --pin "$IMAGE_PIN" || image_status=$?
 if [[ "$image_status" != 0 && "$image_status" != 5 ]]; then
     exit "$image_status"
+fi
+if [[ "$image_status" == 5 && -n "$BENCHMARK_SHARED" ]]; then
+    echo "BENCHMARK_SHARED: the experiment image does not hold the frozen source; it cannot be resumed." >&2
+    exit 1
 fi
 if [[ "$image_status" == 5 ]]; then
     # The frozen source differs from the code in this image: load it, removing what it dropped.
@@ -210,7 +241,9 @@ prepare_run_directory() {
 }
 
 run_packages() {
-    "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" run \
+    local runner=package_benchmarks.py
+    [[ -z "$BENCHMARK_SHARED" ]] || runner=shared_run.py
+    "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/$runner" run \
         --run "$RUN_DIR" --image "$EXPERIMENT_DIR/image" --jobs "$BENCHMARK_JOBS" &
     WORKER_PID=$!
     local status=0
@@ -229,6 +262,14 @@ run_packages() {
 # (before) counts the generated candidates that are real Pharo names.
 publish_results() {
     local name set
+    if [[ -n "$BENCHMARK_SHARED" ]]; then
+        # Every host ends with the complete run; the first one to get here publishes.
+        if ! mkdir "$RESULTS_DIR/.running" 2>/dev/null; then
+            echo "Another host of the run is publishing the results to $RESULTS_DIR"
+            return 0
+        fi
+        RESULTS_LOCKED=1
+    fi
     "$PIPELINE_PYTHON" "$SCRIPT_DIR/scripts/package_benchmarks.py" aggregate \
         --run "$RUN_DIR" --image "$EXPERIMENT_DIR/image"
     local publication="$PUBLICATION_DIR"
