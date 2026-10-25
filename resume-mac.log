@@ -1,0 +1,21 @@
+Saved selection: 50 benchmark packages
+/Users/omar/Downloads/heuristics-vs-llm/oar-runs/336588/benchmark-selection.json
+StdioStream: #stdout
+Benchmark packages (saved): /Users/omar/Downloads/heuristics-vs-llm/oar-runs/336588/benchmark-selection.json
+Run directory: /Users/omar/Downloads/heuristics-vs-llm/oar-runs/336588/benchmark-run.zrN2cB
+Benchmarks running at the same time (BENCHMARK_JOBS): 2
+Starting Ollama at 127.0.0.1:63920: 2 parallel requests, up to 4 models loaded
+Ollama model available: pharo-llm/Qwen2.5-Coder-SFT:0.5B
+Ollama model available: pharo-llm/Qwen2.5-Coder-SFT:1.5B
+Ollama model available: pharo-llm/Qwen2.5-Coder-SFT:3b
+Ollama model available: pharo-llm/Qwen2.5-Coder-SFT:7b
+Running baseline, dependency, LLM completion and hybrid benchmarks on the saved packages
+492 benchmarks of 50 packages to run, 2 at a time
+Started Slot-Tests [messages llmUnvalidated3B] (1/2 slots)
+Started Reflectivity-Tests [messages llmUnvalidated3B] (2/2 slots)
+  Slot-Tests [messages llmUnvalidated3B]: Methods - 3B-LLM Completion BEFORE Pharo validation done in 791.4 min: 46206 of 192514 generated candidates are real Pharo names (24.0%)
+Started Morphic-Widgets-Windows [messages llmUnvalidated3B] (2/2 slots)
+  Reflectivity-Tests [messages llmUnvalidated3B]: Methods - 3B-LLM Completion BEFORE Pharo validation done in 1654.5 min: 96421 of 365484 generated candidates are real Pharo names (26.4%)
+Started Reflectivity-Tests [messages llm3B] (2/2 slots)
+  Morphic-Widgets-Windows [messages llmUnvalidated3B]: Methods - 3B-LLM Completion BEFORE Pharo validation done in 1080.2 min: 46076 of 203847 generated candidates are real Pharo names (22.6%)
+Started Reflectivity-Tests [messages hybrid3B] (2/2 slots)

@@ -1,0 +1,6 @@
+nohup: ignoring input
+Run: /home/oabedelk/heuristics-vs-llm/oar-runs/336588/benchmark-run.zrN2cB (439 benchmarks already done; they are kept)
+Hosts: 2, 8 benchmarks each; walltime 9:58:00
+OAR_JOB_ID=336724
+OAR_JOB_ID=336725
+Follow them: tail -f /home/oabedelk/heuristics-vs-llm/heuristic-completion.<jobid>.out
